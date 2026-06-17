@@ -1440,20 +1440,11 @@ function restoreData(ev){
 }
 // 한 주(시작 월요일 ws)의 식단을 확정본으로 저장(덮어쓰기 = 수정)
 function confirmWeek(ws){
-  // 이미 확정된 주에서 다시 누르면 → 그 주를 하얗게 리셋
+  // 이미 확정된 주에서 다시 누르면 → 확정 표시만 해제(하양). 식단은 그대로 둠.
   if(S.confirmed[ws]){
-    if(!confirm(fmt(ws)+'~ 주를 다시 비울까요? (확정도 해제됩니다)'))return false;
-    const wd0=[];for(let i=0;i<7;i++)wd0.push(addDays(ws,i));   // 월~일
-    wd0.forEach(d=>{
-      if(d===addDays(ws,6)){ if(S.plan[d])S.plan[d].일요일={items:[]}; return; } // 일요일 도시락 비움
-      if(S.plan[d]){['조식','점심','저녁'].forEach(meal=>{
-        if(meal==='조식')S.plan[d][meal]={items:BREAKFAST_BASE.map(n=>({n}))};
-        else S.plan[d][meal]={items:[]};
-      })}
-    });
     delete S.confirmed[ws];
     save();render();
-    toast(fmt(ws)+'~ 주를 비웠어요',false);
+    toast(fmt(ws)+'~ 주 확정을 풀었어요 (식단은 그대로)',false);
     return true;
   }
   const wd=[];for(let i=0;i<6;i++)wd.push(addDays(ws,i));
@@ -1462,7 +1453,7 @@ function confirmWeek(ws){
   wd.forEach(d=>['점심','저녁'].forEach(meal=>{
     if(!((S.plan[d]&&S.plan[d][meal]&&S.plan[d][meal].items)||[]).length)blanks++;
   }));
-  if(blanks&&!confirm('비어 있는 끼니가 '+blanks+'개 있어요. 이대로 확정할까요?'))return false;
+  if(blanks&&!window.__skipBlankConfirm&&!confirm('비어 있는 끼니가 '+blanks+'개 있어요. 이대로 확정할까요?'))return false;
   const data={};
   [...wd,sun].forEach(d=>{data[d]={};['조식','점심','저녁'].forEach(meal=>{
     const its=((S.plan[d]&&S.plan[d][meal]&&S.plan[d][meal].items)||[]);
@@ -1584,20 +1575,24 @@ function openQuiz(){S.quizOpen=true;quizStep='slot';save();renderQuiz();
   const c=document.getElementById('quizcard');if(c&&c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'nearest'})}
 
 /* ===== 시작 ===== */
-/* 6/15 주 실제 식단 1회 주입 (이미 있으면 건드리지 않음) */
+/* 6/15 주 실제 식단 주입 + 확정 (실제 식단이므로 고정). 조리장이 바꾸면 그 뒤론 유지 */
 (function seedRealWeek(){
   try{
     const seedEl=document.getElementById('seed');if(!seedEl)return;
     const SEED=JSON.parse(seedEl.textContent||'{}');
-    if(S.seeded615)return;                       // 이미 주입했으면 끝
-    Object.keys(SEED).forEach(d=>{
-      S.plan[d]=S.plan[d]||{};
-      ['조식','점심','저녁'].forEach(meal=>{
-        const arr=SEED[d][meal]||[];
-        if(arr.length) S.plan[d][meal]={items:arr.map(n=>({n}))};
+    const ws='2026-06-15';
+    // 6/15 주가 아직 확정 안 됐고, 조리장이 손대지 않았으면(=확정 이력 없음) 실제 식단으로 채움
+    if(!S.confirmed[ws]){
+      Object.keys(SEED).forEach(d=>{
+        S.plan[d]=S.plan[d]||{};
+        ['조식','점심','저녁'].forEach(meal=>{
+          const arr=SEED[d][meal]||[];
+          if(arr.length) S.plan[d][meal]={items:arr.map(n=>({n}))};
+        });
       });
-    });
-    S.seeded615=true;
+      // 실제 식단이므로 확정 처리(자동데이터가 못 덮어쓰게 고정)
+      if(typeof confirmWeek==='function'){window.__skipBlankConfirm=true;confirmWeek(ws);window.__skipBlankConfirm=false;}
+    }
     if(!S.start)S.start=monday('2026-06-22');     // 짜는 주 = 6/22 (직전 주 6/15가 위에 보임)
     save();
   }catch(e){}
