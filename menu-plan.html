@@ -365,7 +365,10 @@ if(S.planLogicVer!==PLAN_LOGIC_VER){
   S.planLogicVer=PLAN_LOGIC_VER;
 }
 let saveTimer=null;
+let lastLocalSave=0;
 const save=()=>{
+  lastLocalSave=Date.now();
+  S.planLogicVer=PLAN_LOGIC_VER;
   try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){toast('저장 공간이 가득 찼어요',false)}
   // Firebase에도 저장 (잠깐 모아서 한 번에 — 너무 자주 쓰지 않게)
   if(FB_ON && fbReady && fbRef && !fbApplying){
@@ -396,12 +399,16 @@ function initFirebase(){
       // 이후 다른 직원이 바꾸면 실시간 반영
       fbRef.on('value', snap2=>{
         if(fbApplying) return;
+        if(Date.now()-lastLocalSave < 2500) return;   // 내가 방금 올린 메아리는 무시
         const r=snap2.val(); if(!r||r.planLogicVer!==PLAN_LOGIC_VER) return;
+        // 사용자가 입력 중이면(모달 열림 / 일요일칸 등 입력 포커스) 데이터만 갱신하고 화면은 건드리지 않음
+        const editing = (document.getElementById('sheet')&&document.getElementById('sheet').classList.contains('on'))
+                        || (document.activeElement && /TEXTAREA|INPUT/.test(document.activeElement.tagName));
         fbApplying=true;
         S=r;S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
-        if(typeof render==='function'){buildPeriod(S.start);render()}
+        if(!editing && typeof render==='function'){buildPeriod(S.start);render()}
       });
     }).catch(()=>{ fbReady=false; });
   }catch(e){ /* 키가 잘못됐어도 localStorage로 계속 작동 */ }
@@ -1326,14 +1333,14 @@ function setMainIng(i,g){
   else MENU[it.n].mainIng=g;
   if(g && !MAIN_ING_DICT.includes(g))MAIN_ING_DICT.push(g);   // 새 주재료는 사전에 추가(다음 검색에 뜸)
   S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{mainIng:g});
-  save();drawSheet();render();
+  save();drawSheet();
 }
 function setItemIng(i,g){
   const it=S.plan[cur.date][cur.meal].items[i];if(!it)return;
   if(!MENU[it.n])MENU[it.n]={name:it.n,slot:'메인',alg:'',cnt:0,ing:g,taste:'담백',tier:'B',flag:false};
   else MENU[it.n].ing=g;
   S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{ing:g});
-  save();drawSheet();render();
+  save();drawSheet();
 }
 function toggleAlg(i,num){
   const it=S.plan[cur.date][cur.meal].items[i];if(!it)return;
@@ -1347,7 +1354,7 @@ function toggleAlg(i,num){
   if(!MENU[it.n])MENU[it.n]={name:it.n,slot:findSlot||'메인',alg:val,cnt:0,ing:'기타',taste:'담백',tier:'B',flag:false};
   else MENU[it.n].alg=val;
   S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{alg:val});
-  save();drawSheet();render();
+  save();drawSheet();   // 모달만 다시 그림 (식단판 전체 render는 모달 닫을 때)
 }
 function snapshot(){return JSON.stringify(S.plan[cur.date][cur.meal])}
 function restore(snap){S.plan[cur.date][cur.meal]=JSON.parse(snap);save();drawSheet();render()}
