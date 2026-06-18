@@ -298,7 +298,7 @@ window.FIREBASE_CONFIG = {
 <button onclick="move(1)" aria-label="다음 2주">▶</button>
 </div>
 <span class="spacer"></span>
-<button class="btn ghost" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관함</button>
+<button class="btn ghost" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관함</button>
 <button class="btn ghost" onclick="openGuide()" title="이 프로그램이 어떻게 작동하는지 설명">기준</button>
 <button class="quizpill" id="quizpill" onclick="openQuiz()" style="display:none"></button>
 <button class="btn" onclick="downloadConfirmed()" title="확정한 식단표 전체를 엑셀로 (디자인팀 전달용)">엑셀</button>
@@ -437,7 +437,10 @@ function isGeneric(n){return GENERIC.has(n)}
 function isDess(n){return slotOf(n)==='후식'||isGeneric(n)}
 function tasteOf(n){const m=MENU[n];return m&&m.taste?m.taste:'담백'}
 function ingOf(n){const m=MENU[n];return m&&m.ing?m.ing:'기타'}
-function algOf(n){const m=MENU[n];return m&&m.alg?m.alg:''}
+function algOf(n){
+  if(n==='흰밥'||n==='흑미밥'||n==='후식'||n==='후식11') return '';   // 밥·맹맹한 후식은 알레르기 표시 안 함(원본 식단표 기준)
+  const m=MENU[n];return m&&m.alg?m.alg:'';
+}
 
 /* ===== 날짜 ===== */
 const DOW=['월','화','수','목','금','토','일'];
@@ -669,12 +672,14 @@ function badItemSet(date,meal){
 }
 
 /* ===== 렌더 ===== */
+function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){const n=(S.saved||[]).length;sb.textContent=n?('보관 '+n):'보관함'}}
 function render(){
   if(!S.start)S.start=monday(iso(new Date()));
   const topStart=addDays(S.start,-7);          // 위 = 직전 주(참고)
   buildPeriod(topStart);absorbPlan();save();
   const dates=periodDates(topStart);           // 위(직전)부터 2주 = 직전 주 + 짜는 주
   document.getElementById('perLabel').textContent=fmt(S.start)+' ~ '+fmt(addDays(S.start,5))+' 짜는 중';
+  updateStockBtn();
   let totalBad=0;
   const weeksEl=document.getElementById('weeks');let H='';
   for(let wk=0;wk<2;wk++){
@@ -791,6 +796,7 @@ function wireDrag(){
 }
 function openSheet(date,meal){
   cur={date,meal};findSlot='메인';replaceIdx=-1;expandIdx=-1;algEditIdx=-1;quickOpen=false;
+  _lastFindQ=null;_lastMealQ=null;
   document.getElementById('shTitle').textContent=fmt(date)+'('+DOW[(parse(date).getDay()+6)%7]+') '+meal;
   drawSheet();
   document.getElementById('scrim').classList.add('on');
@@ -800,7 +806,7 @@ function openSheet(date,meal){
 function closeSheet(){
   if(S.plan&&S.plan['__stock__']){delete S.plan['__stock__'];S._draft=null;}
   if(stockMode&&cur&&cur.stock){cur=null;drawStock();render();return;}  // 한 상 만들다 닫으면 보관함 목록으로
-  stockMode=false;cur=null;document.getElementById('scrim').classList.remove('on');
+  stockMode=false;cur=null;_boardDirty=false;document.getElementById('scrim').classList.remove('on');
   document.getElementById('sheet').classList.remove('on');render()}
 function openGuide(){
   cur=null;
@@ -844,7 +850,7 @@ function drawStock(){
 /* 새 한 상 만들기 — 임시 끼니(cur.date='__stock__')로 기존 편집 UI 재활용 */
 function newStock(id){
   const draft=id||('stk'+Date.now());
-  if(!id){ S._draft={id:draft,items:[]}; }
+  if(!id){ S._draft={id:draft,items:[{n:'흰밥'},{n:'김치'}]}; }   // 기본 흰밥·김치 (식단 칸과 동일)
   else{ const s=(S.saved||[]).find(x=>x.id===id); S._draft={id:draft,items:(s?s.items.slice():[]).map(n=>({n}))}; }
   cur={date:'__stock__',meal:'점심',stock:true};
   findSlot='메인';replaceIdx=-1;expandIdx=-1;algEditIdx=-1;quickOpen=false;
@@ -863,7 +869,7 @@ function saveStock(){
   const rec={id,items:items.slice(),at:Date.now()};
   if(ex>=0)S.saved[ex]=rec; else S.saved.push(rec);
   delete S.plan['__stock__'];S._draft=null;cur=null;
-  save();drawStock();toast('보관함에 저장했어요',false);
+  save();drawStock();updateStockBtn();toast('보관함에 저장했어요',false);
 }
 /* 보관함 한 상을 '지금 보는 주'의 한 칸에 쓰기 → 보관함서 빠짐 */
 /* 보관함 한 상을 '지금 연 칸'에 바로 넣기 → 보관함서 빠짐 */
@@ -875,13 +881,13 @@ function useStockHere(id){
   S.plan[cur.date][cur.meal]={items:s.items.map(n=>({n}))};
   S.saved=S.saved.filter(x=>x.id!==id);   // 쓴 것은 보관함서 빠짐
   lastAct={snap,date:cur.date,meal:cur.meal};
-  absorbPlan();save();drawSheet();render();
+  absorbPlan();save();drawSheet();markDirty();
   toast('보관함의 한 상을 넣었어요 (보관함서 빠짐)',true);
 }
 function delStock(id){
   if(!confirm('이 한 상을 보관함에서 지울까요?'))return;
   S.saved=(S.saved||[]).filter(x=>x.id!==id);
-  save();drawStock();
+  save();drawStock();updateStockBtn();
 }
 let stockTarget=null;
 const GUIDE_HTML=
@@ -990,7 +996,7 @@ function drawSheet(){
     h+='<div class="seg">'+SLOTS.map(s=>
       '<button class="'+(findSlot===s?'on':'')+'" onclick="setFindSlot(\''+s+'\')">'+s+'</button>').join('')+'</div>';
   }
-  h+='<div class="find"><input id="findIn" placeholder="이름·초성 검색" oninput="drawFind()" autocomplete="off"></div>';
+  h+='<div class="find"><input id="findIn" placeholder="이름·초성 검색" oninput="drawFindD()" autocomplete="off"></div>';
   h+='<div id="findRes"></div>';
   h+='<div id="findNew"></div>';
   if(cur.stock){
@@ -1003,7 +1009,7 @@ function drawSheet(){
   }
   // ===== 한 끼 통째 바꾸기 =====
   h+='<div class="ssec">통째 교체</div>';
-  h+='<div class="find"><input id="mealFind" placeholder="메뉴 이름으로 찾기 (예: 삼계탕)" oninput="drawMealFind()" autocomplete="off"></div>';
+  h+='<div class="find"><input id="mealFind" placeholder="메뉴 이름으로 찾기 (예: 삼계탕)" oninput="drawMealFindD()" autocomplete="off"></div>';
   h+='<div id="mealRes" class="grid2"></div>';
   // 작년·재작년·재재작년 같은 날 + 앞뒤 며칠 — 제외: 이미 깐 출처 / 메인 겹침 / 부실한 끼니
   let quick='';let seen={};
@@ -1271,11 +1277,13 @@ function drawFind(){
   if(window._fq)list=list.filter(m=>m.name.includes(window._fq)||cho(m.name).includes(window._fq));
   // 검색 전: 추천 소수만 (오래 안 쓴 것 위주). 조식은 구분이 없어 검색 유도만.
   const noQuery=!window._fq;
+  // 정렬 키를 항목당 한 번만 계산(무거운 lastBefore 반복 호출 방지). 최근 사용일은 HIST만 사용(가벼움)
+  const lastHist=(name)=>{const a=HIST[name];if(!a||!a.length)return '0';let l='0';for(const dd of a){if(dd<date&&dd>l)l=dd}return l};
+  const dupLight=(name,last)=>{const sl=slotOf(name);if(sl!=='메인'&&sl!=='국')return 0;if(last==='0')return 0;return ((parse(date)-parse(last))/864e5)<RULE.menuWeeks*7?1:0};
+  list.forEach(m=>{m._last=lastHist(m.name); m._dup=dupLight(m.name,m._last);});
   list.sort((a,b)=>{
-    const ag=menuDup(a.name,date)?1:0, bg=menuDup(b.name,date)?1:0;
-    if(ag!==bg)return ag-bg;
-    const al=lastBefore(a.name,date)||'0', bl=lastBefore(b.name,date)||'0';
-    if(al!==bl)return al<bl?-1:1;
+    if(a._dup!==b._dup)return a._dup-b._dup;
+    if(a._last!==b._last)return a._last<b._last?-1:1;
     return (b.cnt||0)-(a.cnt||0);
   });
   const el=document.getElementById('findRes');
@@ -1288,7 +1296,7 @@ function drawFind(){
   }
   if(!list.length&&!tail){el.innerHTML='<div class="empty-note">없어요. 새 이름을 입력하면 새 메뉴로 넣을 수 있어요.</div>';const nw=document.getElementById('findNew');if(nw)nw.innerHTML='';return}
   const grid=list.map(m=>{
-    const bad=menuDup(m.name,date);
+    const bad=m._dup;
     return '<div class="li2'+(bad?' warn':'')+'" onclick="addItem(\''+jss(m.name)+'\')">'
       +'<span class="nm">'+esc(m.name)+(bad?'<span class="wflag">주의</span>':'')+'</span></div>';
   }).join('');
@@ -1297,9 +1305,29 @@ function drawFind(){
   const nw=document.getElementById('findNew');if(nw)nw.innerHTML=tail?'<div class="newmwrap">'+tail+'</div>':'';
 }
 function jss(s){return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'")}
+/* 검색 디바운스 — 짧게(지우기 답답함 방지). 같은 검색어면 다시 안 그림 */
+function drawFindD(){
+  clearTimeout(_findT);
+  _findT=setTimeout(()=>{
+    const q=((document.getElementById('findIn')||{}).value||'').trim();
+    if(q===_lastFindQ)return;        // 결과가 같으면 건너뜀
+    _lastFindQ=q;drawFind();
+  },60);
+}
+function drawMealFindD(){
+  clearTimeout(_mealT);
+  _mealT=setTimeout(()=>{
+    const q=((document.getElementById('mealFind')||{}).value||'').trim();
+    if(q===_lastMealQ)return;
+    _lastMealQ=q;drawMealFind();
+  },70);
+}
 
 /* ===== 동작 ===== */
 let lastAct=null;
+let _findT=null,_mealT=null,_lastFindQ=null,_lastMealQ=null;  // 검색 디바운스 상태
+let _boardDirty=false;                 // 모달 작업으로 식단판이 바뀜 → 닫을 때 한 번만 render
+function markDirty(){_boardDirty=true} // 모달 안에서는 render 대신 이걸 부른다
 function toggleAlgEdit(i){algEditIdx=(algEditIdx===i?-1:i);drawSheet()}
 function setItemSlot(i,label){
   const it=S.plan[cur.date][cur.meal].items[i];if(!it)return;
@@ -1307,7 +1335,7 @@ function setItemSlot(i,label){
   if(!MENU[it.n])MENU[it.n]={name:it.n,slot:real,alg:'',cnt:0,ing:'기타',taste:'담백',tier:'B',flag:false};
   else MENU[it.n].slot=real;
   S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{slot:real});
-  save();drawSheet();render();
+  save();drawSheet();markDirty();
 }
 /* 주재료 검색 — 사전(MAIN_ING_DICT)에서 찾고, 없으면 입력값 그대로 추가 가능 */
 function drawMingFind(i){
@@ -1357,12 +1385,12 @@ function toggleAlg(i,num){
   save();drawSheet();   // 모달만 다시 그림 (식단판 전체 render는 모달 닫을 때)
 }
 function snapshot(){return JSON.stringify(S.plan[cur.date][cur.meal])}
-function restore(snap){S.plan[cur.date][cur.meal]=JSON.parse(snap);save();drawSheet();render()}
+function restore(snap){S.plan[cur.date][cur.meal]=JSON.parse(snap);save();drawSheet();markDirty()}
 function removeItem(i){const snap=snapshot();S.plan[cur.date][cur.meal].items.splice(i,1);
-  lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();render()}
+  lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();markDirty()}
 function addItem(name){const snap=snapshot();
   S.plan[cur.date][cur.meal].items.push({n:name});window._fq='';algEditIdx=-1;
-  lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();render()}
+  lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();markDirty()}
 /* 조식 수동 입력: 여러 줄을 메뉴로 추가, 없는 건 알레르기 1차 자동 매칭 */
 function applyBfText(){
   const ta=document.getElementById('bfText');if(!ta)return;
@@ -1382,7 +1410,7 @@ function applyBfText(){
   ta.value='';
   lastAct={snap,date:cur.date,meal:cur.meal};save();
   toast(added+'개 넣었어요 (알레르기 자동 매칭 — 카드 눌러 확인·수정)',true);
-  drawSheet();render();
+  drawSheet();markDirty();
 }
 function addNew(name){
   const snap=snapshot();
@@ -1396,12 +1424,12 @@ function addNew(name){
   algEditIdx=items.length-1;   // 분류·알레르기 패널 자동 펼침
   lastAct={snap,date:cur.date,meal:cur.meal};save();
   toast('‘'+name+'’ 새 메뉴를 넣었어요 (자동 분류했어요, 확인해 주세요)',true);
-  drawSheet();render();
+  drawSheet();markDirty();
 }
 function swapWholeMeal(refDate,srcMeal){const snap=snapshot();
   S.plan[cur.date][cur.meal]={items:pullMeal(refDate,srcMeal||cur.meal),ref:refDate};
   lastAct={snap,date:cur.date,meal:cur.meal};save();
-  toast('이 끼니를 '+fmt(refDate)+' 식단으로 바꿨어요',true);drawSheet();render()}
+  toast('이 끼니를 '+fmt(refDate)+' 식단으로 바꿨어요',true);drawSheet();markDirty()}
 function swapWholeRec(srcDate,srcMeal){const snap=snapshot();
   let items, label;
   if(String(srcDate).startsWith('saved')){
@@ -1412,7 +1440,7 @@ function swapWholeRec(srcDate,srcMeal){const snap=snapshot();
   }
   S.plan[cur.date][cur.meal]={items,ref:srcDate};
   window._mq='';lastAct={snap,date:cur.date,meal:cur.meal};save();
-  toast('이 끼니를 '+label+'으로 바꿨어요',true);drawSheet();render()}
+  toast('이 끼니를 '+label+'으로 바꿨어요',true);drawSheet();markDirty()}
 function undo(){if(!lastAct)return;S.plan[lastAct.date][lastAct.meal]=JSON.parse(lastAct.snap);
   lastAct=null;save();if(cur)drawSheet();render();document.getElementById('toast').style.display='none'}
 
