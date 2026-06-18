@@ -298,7 +298,7 @@ window.FIREBASE_CONFIG = {
 <button onclick="move(1)" aria-label="다음 2주">▶</button>
 </div>
 <span class="spacer"></span>
-<button class="btn ghost" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관함</button>
+<button class="btn ghost" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관</button>
 <button class="btn ghost" onclick="openGuide()" title="이 프로그램이 어떻게 작동하는지 설명">기준</button>
 <button class="quizpill" id="quizpill" onclick="openQuiz()" style="display:none"></button>
 <button class="btn" onclick="downloadConfirmed()" title="확정한 식단표 전체를 엑셀로 (디자인팀 전달용)">엑셀</button>
@@ -672,7 +672,7 @@ function badItemSet(date,meal){
 }
 
 /* ===== 렌더 ===== */
-function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){const n=(S.saved||[]).length;sb.textContent=n?('보관 '+n):'보관함'}}
+function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){const n=(S.saved||[]).length;sb.textContent=n?('보관 '+n):'보관'}}
 function render(){
   if(!S.start)S.start=monday(iso(new Date()));
   const topStart=addDays(S.start,-7);          // 위 = 직전 주(참고)
@@ -819,7 +819,7 @@ function openGuide(){
 let stockMode=false;           // 보관함 화면 켜짐
 function openStock(){
   cur=null;stockMode=true;
-  document.getElementById('shTitle').textContent='보관함';
+  document.getElementById('shTitle').textContent='보관';
   drawStock();
   document.getElementById('scrim').classList.add('on');
   document.getElementById('sheet').classList.add('on');
