@@ -203,6 +203,12 @@ background:#F4F8F6;border-radius:9px;padding:10px 12px;font-size:14px;margin-top
 .altday:hover{border-color:var(--g);background:var(--gbg)}
 .altday .yr{font-size:12px;font-weight:800;color:var(--gd);margin-bottom:4px}
 .altday .ln{font-size:12.5px;color:#41514A;line-height:1.5}
+.curhead{display:flex;align-items:center;justify-content:space-between;margin:14px 0 6px}
+.clearmeal{border:1px solid var(--line);background:#fff;color:var(--mut);border-radius:7px;padding:5px 12px;font-size:12.5px;cursor:pointer;font-family:inherit}
+.clearmeal:hover{border-color:#d66;color:#c44}
+.curheadbtns{display:flex;gap:6px}
+.restorebtn{border:1px solid var(--g);background:var(--gbg);color:var(--gd);border-radius:7px;padding:5px 12px;font-size:12.5px;cursor:pointer;font-family:inherit;font-weight:700}
+.restorebtn:hover{background:#E4F0EA}
 .empty-note{color:var(--faint);font-size:13px;text-align:center;padding:18px 0}
 .stocknew{width:100%;border:1px dashed var(--g);background:var(--gbg);color:var(--gd);border-radius:10px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;margin-bottom:14px}
 .stocknew:hover{background:#E4F0EA}
@@ -359,9 +365,10 @@ S.start=S.start||null;        // 현재 보는 2주의 시작(월요일)
 S.confirmed=S.confirmed||{};  // 'YYYY-MM-DD'(주 시작) -> {dates:[...], data:{date:{끼니:[names]}}, at:확정시각}
 S.skip=S.skip||[];            // '나중에 보기'한 메뉴
 S.saved=S.saved||[];          // 보관함: 아직 안 쓴 한 상 조합 (통째 교체 검색엔 안 넣음 — 분리)
-// 로직이 바뀌었으면, 자동으로 채워둔 식단은 비우고 다시 채움 (확정본은 그대로 보존)
+S.cleared=S.cleared||{};      // 모두빼기한 끼니의 복구용 스냅샷 (date|meal -> snap)
+// 로직 버전이 바뀌어도 사용자가 짠 식단은 절대 비우지 않는다 (확정·작성 중인 것 보존).
+// 버전은 기록만 갱신. 빈 칸은 buildPeriod가 알아서 채우고, 이미 있는 칸은 그대로 둔다.
 if(S.planLogicVer!==PLAN_LOGIC_VER){
-  S.plan={};
   S.planLogicVer=PLAN_LOGIC_VER;
 }
 let saveTimer=null;
@@ -369,6 +376,7 @@ let lastLocalSave=0;
 const save=()=>{
   lastLocalSave=Date.now();
   S.planLogicVer=PLAN_LOGIC_VER;
+  S.updatedAt=Date.now();          // 저장 시각 — 충돌 시 더 최근 것이 이긴다
   try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){toast('저장 공간이 가득 찼어요',false)}
   // Firebase에도 저장 (잠깐 모아서 한 번에 — 너무 자주 쓰지 않게)
   if(FB_ON && fbReady && fbRef && !fbApplying){
@@ -384,24 +392,31 @@ function initFirebase(){
     fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
     fbRef.once('value').then(snap=>{
       const remote=snap.val();
-      if(remote && remote.planLogicVer===PLAN_LOGIC_VER){
+      const localTime=S.updatedAt||0;
+      const remoteTime=(remote&&remote.updatedAt)||0;
+      const remoteHasPlan = remote && remote.plan && Object.keys(remote.plan).length;
+      const localHasPlan = S.plan && Object.keys(S.plan).length;
+      // 원격이 내 것보다 최신이고 식단이 있으면 원격 사용. 아니면 내 것을 유지(필요시 올림)
+      if(remoteHasPlan && (remoteTime>=localTime || !localHasPlan)){
         fbApplying=true;
         S=remote;
         S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
+        S.planLogicVer=PLAN_LOGIC_VER;
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
-      }else{
-        // 원격이 비었거나 옛 버전 → 지금 내 데이터를 올림
+      }else if(localHasPlan){
+        // 내 것이 더 최신(또는 원격이 비었음) → 내 것을 올려 보존
         try{ fbRef.set(S) }catch(e){}
       }
       fbReady=true;
-      // 이후 다른 직원이 바꾸면 실시간 반영
+      // 이후 다른 직원이 바꾸면 실시간 반영 — 단, 내 것보다 오래된 데이터는 무시
       fbRef.on('value', snap2=>{
         if(fbApplying) return;
         if(Date.now()-lastLocalSave < 2500) return;   // 내가 방금 올린 메아리는 무시
-        const r=snap2.val(); if(!r||r.planLogicVer!==PLAN_LOGIC_VER) return;
-        // 사용자가 입력 중이면(모달 열림 / 일요일칸 등 입력 포커스) 데이터만 갱신하고 화면은 건드리지 않음
+        const r=snap2.val(); if(!r||!r.plan) return;
+        if((r.updatedAt||0) < (S.updatedAt||0)) return;  // 받은 게 내 것보다 오래됐으면 무시(옛 데이터가 새 걸 덮지 않게)
+        // 사용자가 입력 중이면(모달 열림 / 입력 포커스) 데이터만 갱신하고 화면은 건드리지 않음
         const editing = (document.getElementById('sheet')&&document.getElementById('sheet').classList.contains('on'))
                         || (document.activeElement && /TEXTAREA|INPUT/.test(document.activeElement.tagName));
         fbApplying=true;
@@ -945,7 +960,14 @@ function drawSheet(){
       +'<textarea id="bfText" class="bfman-ta" placeholder="예)&#10;계란찜&#10;시금치나물&#10;요구르트"></textarea>'
       +'<button class="bfman-btn" onclick="applyBfText()">적용</button></div>';
   }
-  // ===== 현재 구성: 메인 먼저(식단표와 동일), 모든 메뉴에 알레르기번호 + [바꾸기][빼기] =====
+  // ===== 현재 구성: 메인 먼저, [교체][빼기] / 모두빼기 / 복구 =====
+  const hasCleared = !cur.stock && S.cleared && S.cleared[cur.date+'|'+cur.meal];
+  if((items.length || hasCleared) && !cur.stock){
+    h+='<div class="curhead"><span class="ssec" style="margin:0">현재 구성</span><span class="curheadbtns">';
+    if(hasCleared) h+='<button class="restorebtn" onclick="restoreCleared()">복구</button>';
+    if(items.length) h+='<button class="clearmeal" onclick="clearMeal()">모두빼기</button>';
+    h+='</span></div>';
+  }
   h+='<div class="curlist">';
   if(!items.length)h+='<div class="empty-note">비어 있어요. 아래에서 골라 담으세요.</div>';
   items.forEach((it)=>{
@@ -988,11 +1010,7 @@ function drawSheet(){
   h+='</div>';
   // ===== 추가하기 (검색 — 위쪽에 둬서 결과가 아래로만 펼쳐지게) =====
   h+='<div class="ssec">추가</div>';
-  // 조식은 메인/반찬 구분이 의미 없어 탭 없이 전체 검색. 점심·저녁만 구분 탭.
-  if(meal!=='조식'){
-    h+='<div class="seg">'+SLOTS.map(s=>
-      '<button class="'+(findSlot===s?'on':'')+'" onclick="setFindSlot(\''+s+'\')">'+s+'</button>').join('')+'</div>';
-  }
+  // 메인/반찬 구분 없이 전체 검색 — 이름으로 찾으면 다 나오고, 넣을 때 원래 구분으로 자동 분류
   h+='<div class="find"><input id="findIn" placeholder="이름·초성 검색" oninput="drawFindD()" autocomplete="off"></div>';
   h+='<div id="findRes"></div>';
   h+='<div id="findNew"></div>';
@@ -1267,10 +1285,7 @@ function setFindSlot(s){findSlot=s;window._fq='';drawSheet()}
 function drawFind(){
   const q=(document.getElementById('findIn')||{}).value||'';window._fq=q.trim();
   const date=cur.date;
-  const realSlot=normSlot(findSlot);
-  let list=(cur.meal==='조식')
-    ? Object.values(MENU)                          // 조식: 구분 없이 전체에서 검색
-    : Object.values(MENU).filter(m=>m.slot===realSlot);
+  let list=Object.values(MENU);                    // 구분 없이 전체에서 검색 (메인·반찬 구분 못해도 이름으로 찾음)
   if(window._fq)list=list.filter(m=>m.name.includes(window._fq)||cho(m.name).includes(window._fq));
   // 검색 전: 추천 소수만 (오래 안 쓴 것 위주). 조식은 구분이 없어 검색 유도만.
   const noQuery=!window._fq;
@@ -1284,8 +1299,8 @@ function drawFind(){
     return (b.cnt||0)-(a.cnt||0);
   });
   const el=document.getElementById('findRes');
-  if(noQuery && cur.meal==='조식'){el.innerHTML='';const nw=document.getElementById('findNew');if(nw)nw.innerHTML='';return}
-  list=list.slice(0, noQuery?6:30);   // 검색 전엔 추천 6개, 검색하면 30개까지
+  if(noQuery){el.innerHTML='';el.classList.remove('searching');const nw=document.getElementById('findNew');if(nw)nw.innerHTML='';return}
+  list=list.slice(0,30);   // 검색하면 30개까지
   let tail='';
   if(window._fq && !Object.values(MENU).some(m=>m.name===window._fq)){
     tail='<div class="li2 newm" onclick="addNew(\''+jss(window._fq)+'\')">'
@@ -1385,6 +1400,23 @@ function snapshot(){return JSON.stringify(S.plan[cur.date][cur.meal])}
 function restore(snap){S.plan[cur.date][cur.meal]=JSON.parse(snap);save();drawSheet();markDirty()}
 function removeItem(i){const snap=snapshot();S.plan[cur.date][cur.meal].items.splice(i,1);
   lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();markDirty()}
+/* 한 끼 통째로 빼기 (전부). 복구 정보를 S에 저장해 모달 닫아도 유지 */
+function clearMeal(){
+  const snap=snapshot();
+  S.cleared=S.cleared||{};
+  S.cleared[cur.date+'|'+cur.meal]=snap;   // 모달 닫혀도 남는다
+  S.plan[cur.date][cur.meal]={items:[]};
+  lastAct={snap,date:cur.date,meal:cur.meal};
+  save();drawSheet();markDirty();
+}
+function restoreCleared(){
+  const key=cur.date+'|'+cur.meal;
+  if(!S.cleared||!S.cleared[key])return;
+  S.plan[cur.date][cur.meal]=JSON.parse(S.cleared[key]);
+  delete S.cleared[key];
+  save();drawSheet();markDirty();
+  toast('복구했어요',false);
+}
 function addItem(name){const snap=snapshot();
   S.plan[cur.date][cur.meal].items.push({n:name});window._fq='';algEditIdx=-1;
   lastAct={snap,date:cur.date,meal:cur.meal};save();drawSheet();markDirty()}
@@ -1468,9 +1500,8 @@ function restoreData(ev){
       const obj=JSON.parse(rd.result);
       if(!obj||typeof obj!=='object'||!('plan' in obj)){alert('이 파일은 바른식당 백업 파일이 아니에요.');return}
       if(!confirm('지금 식단을 백업 파일 내용으로 바꿀까요? (현재 작업은 사라집니다)'))return;
-      S=obj;S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];
-      // 옛 백업이면 자동식단은 새 로직으로 다시 채움 (확정본은 보존)
-      if(S.planLogicVer!==PLAN_LOGIC_VER){S.plan={};S.planLogicVer=PLAN_LOGIC_VER;}
+      S=obj;S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
+      S.planLogicVer=PLAN_LOGIC_VER;   // 버전만 갱신, 식단은 백업 그대로 보존
       save();render();
       toast('백업을 불러왔어요',false);
     }catch(e){alert('파일을 읽지 못했어요.')}
