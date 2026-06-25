@@ -343,9 +343,16 @@ window.FIREBASE_CONFIG = {
 const DB=JSON.parse(document.getElementById('data').textContent);
 const BYDAY=DB.byday;                 // date -> {점심:[],저녁:[]}
 const MENU={};DB.menus.forEach(m=>MENU[m.name]=m);
+const CORE_MENU_FIX={
+  '김치':{slot:'기본',alg:'',ing:'기타',taste:'매움',tier:'B'},
+  '깍두기':{slot:'기본',alg:'',ing:'기타',taste:'매움',tier:'B'},
+  '흰밥':{slot:'기본',alg:'',ing:'쌀',taste:'담백',tier:'B'},
+  '후식':{slot:'후식',alg:'',ing:'기타',taste:'담백',tier:'B'},
+  '요구르트':{slot:'후식',alg:'',ing:'기타',taste:'담백',tier:'B'}
+};
 function ensureMenu(name, slot, alg){
   if(!name||MENU[name])return;
-  MENU[name]={name,slot:slot||'반찬',alg:alg||'',cnt:0,ing:'기타',taste:'담백',tier:'B',flag:false};
+  MENU[name]={name,slot:slot||'반찬',alg:alg||'',cnt:0,ing:'기타',taste:inferMissingTaste(name),tier:'B',flag:false};
 }
 function inferMissingSlot(name){
   if(/^(흰밥|쌀밥|잡곡밥|현미밥|김치|깍두기|단무지|피클)$/.test(name))return '기본';
@@ -353,8 +360,21 @@ function inferMissingSlot(name){
   if(/(후식|요구르트|요플레|음료|주스|과일|황도|귤|바나나|몽쉘|쿠키|카스타드)/.test(name))return '후식';
   return '반찬';
 }
+function inferMissingTaste(name){
+  if(/(김치|깍두기|파김치|열무김치|볶음김치)/.test(name))return '매움';
+  if(/(튀김|까스|전|구이|강정|고로케)/.test(name))return '기름';
+  if(/(간장|조림|장조림|불고기)/.test(name))return '간장';
+  return '담백';
+}
+function enforceCoreMenus(){
+  Object.keys(CORE_MENU_FIX).forEach(name=>{
+    MENU[name]=Object.assign(MENU[name]||{name,cnt:0,flag:false},CORE_MENU_FIX[name],{name,flag:false});
+    try{if(S&&S.fix)S.fix[name]=Object.assign(S.fix[name]||{},CORE_MENU_FIX[name]);}catch(e){}
+  });
+}
 ['김치','흰밥','깍두기','후식','요구르트'].forEach(n=>ensureMenu(n,inferMissingSlot(n),''));
 (DB.records||[]).forEach(r=>ensureMenu((r.menu||'').trim(),inferMissingSlot((r.menu||'').trim()),r.alg||''));
+enforceCoreMenus();
 const ALG={1:'난류',2:'우유',3:'메밀',4:'땅콩',5:'대두',6:'밀',7:'고등어',8:'게',9:'새우',10:'돼지고기',11:'복숭아',12:'토마토',13:'아황산류',14:'호두',15:'닭고기',16:'쇠고기',17:'오징어',18:'조개류',19:'잣'};
 /* 끼니 last-served index from history (점심/저녁) */
 const HIST={};DB.records.forEach(r=>{(HIST[r.menu]=HIST[r.menu]||[]).push(r.date)});
@@ -425,6 +445,7 @@ function backupStoredState(reason){
 function applyFixesToMenu(){
   S.fix=S.fix||{};
   Object.keys(S.fix).forEach(n=>{if(MENU[n])Object.assign(MENU[n],S.fix[n],{flag:false})});
+  enforceCoreMenus();
 }
 let STATE_LAST=null;
 function stateClone(v){return JSON.parse(JSON.stringify(v==null?null:v));}
@@ -1804,7 +1825,7 @@ function toast(msg,undoable,fn){const t=document.getElementById('toast');
 /* 저장된 분류 보정 적용 */
 S.fix=S.fix||{};                       // name -> {slot,ing,taste}
 S.skip=S.skip||[];                     // 나중에 보기
-Object.keys(S.fix).forEach(n=>{if(MENU[n])Object.assign(MENU[n],S.fix[n],{flag:false})});
+applyFixesToMenu();
 function quizList(){return Object.values(MENU).filter(m=>m.flag&&!S.skip.includes(m.name))}
 let quizStep='slot';                   // slot -> ing -> taste
 function renderQuiz(){
