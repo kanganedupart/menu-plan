@@ -169,6 +169,18 @@ padding:6px 9px;font-family:inherit;color:var(--ink)}
 .mingclear{font-size:11px;color:var(--faint);margin-top:5px;cursor:pointer;text-decoration:underline}
 .mingclear:hover{color:var(--warnred)}
 .alglab{font-size:11.5px;font-weight:700;color:var(--gd);margin:8px 0 5px}
+.alglab-sub{font-weight:600;color:#A7B5AD;font-size:10.5px}
+.tbadge{display:inline-block;font-size:9.5px;font-weight:800;line-height:1.5;padding:0 5px;border-radius:4px;margin-right:5px;vertical-align:1px}
+.tbadge.t매움{background:#F4D4D0;color:#B5524A}
+.tbadge.t간장{background:#E8DCC8;color:#8A6D3B}
+.tbadge.t기름{background:#F5EAC8;color:#8F7A2E}
+.tbadge.t담백{background:#DCEBE0;color:#4E7558}
+.tchip{border:1px solid var(--line);background:#fff;border-radius:7px;font-size:12px;cursor:pointer;padding:6px 13px;font-family:inherit}
+.tchip.t매움{color:#B5524A}.tchip.t간장{color:#8A6D3B}.tchip.t기름{color:#8F7A2E}.tchip.t담백{color:#4E7558}
+.tchip.on.t매움{background:#B5524A;border-color:#B5524A;color:#fff;font-weight:700}
+.tchip.on.t간장{background:#8A6D3B;border-color:#8A6D3B;color:#fff;font-weight:700}
+.tchip.on.t기름{background:#8F7A2E;border-color:#8F7A2E;color:#fff;font-weight:700}
+.tchip.on.t담백{background:#4E7558;border-color:#4E7558;color:#fff;font-weight:700}
 .alglab:first-child{margin-top:0}
 .mini{border:1px solid var(--line);background:#fff;border-radius:7px;padding:5px 9px;font-size:12px;
 font-weight:500;cursor:pointer;color:var(--mut)}
@@ -331,6 +343,18 @@ window.FIREBASE_CONFIG = {
 const DB=JSON.parse(document.getElementById('data').textContent);
 const BYDAY=DB.byday;                 // date -> {점심:[],저녁:[]}
 const MENU={};DB.menus.forEach(m=>MENU[m.name]=m);
+function ensureMenu(name, slot, alg){
+  if(!name||MENU[name])return;
+  MENU[name]={name,slot:slot||'반찬',alg:alg||'',cnt:0,ing:'기타',taste:'담백',tier:'B',flag:false};
+}
+function inferMissingSlot(name){
+  if(/^(흰밥|쌀밥|잡곡밥|현미밥|김치|깍두기|단무지|피클)$/.test(name))return '기본';
+  if(/(국|탕|찌개|스프|육수)$/.test(name))return '국';
+  if(/(후식|요구르트|요플레|음료|주스|과일|황도|귤|바나나|몽쉘|쿠키|카스타드)/.test(name))return '후식';
+  return '반찬';
+}
+['김치','흰밥','깍두기','후식','요구르트'].forEach(n=>ensureMenu(n,inferMissingSlot(n),''));
+(DB.records||[]).forEach(r=>ensureMenu((r.menu||'').trim(),inferMissingSlot((r.menu||'').trim()),r.alg||''));
 const ALG={1:'난류',2:'우유',3:'메밀',4:'땅콩',5:'대두',6:'밀',7:'고등어',8:'게',9:'새우',10:'돼지고기',11:'복숭아',12:'토마토',13:'아황산류',14:'호두',15:'닭고기',16:'쇠고기',17:'오징어',18:'조개류',19:'잣'};
 /* 끼니 last-served index from history (점심/저녁) */
 const HIST={};DB.records.forEach(r=>{(HIST[r.menu]=HIST[r.menu]||[]).push(r.date)});
@@ -356,26 +380,150 @@ const SAVEDSET=new Set();
 
 /* ===== 저장 (Firebase 키가 있으면 공유, 없으면 이 기기에만) ===== */
 const LS='bareun_v11';
+const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 각 기기에서만 기억
+const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
 // Firebase 설정 여부
 const FB_ON = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.databaseURL);
 let fbRef=null, fbReady=false, fbApplying=false;
+let pendingRemoteState=null;
 // 먼저 localStorage로 빠르게 시작 (오프라인·키 없을 때도 작동)
 let S=JSON.parse(localStorage.getItem(LS)||'{}');
-S.plan=S.plan||{};            // date -> {점심:{items:[...]},저녁:{...}}
-S.start=S.start||null;        // 현재 보는 2주의 시작(월요일)
-S.confirmed=S.confirmed||{};  // 'YYYY-MM-DD'(주 시작) -> {dates:[...], data:{date:{끼니:[names]}}, at:확정시각}
-S.skip=S.skip||[];            // '나중에 보기'한 메뉴
-S.saved=S.saved||[];          // 보관함: 아직 안 쓴 한 상 조합 (통째 교체 검색엔 안 넣음 — 분리)
-S.cleared=S.cleared||{};      // 모두빼기한 끼니의 복구용 스냅샷 (date|meal -> snap)
+function normalizeState(){
+  S.plan=S.plan||{};            // date -> {점심:{items:[...]},저녁:{...}}
+  S.confirmed=S.confirmed||{};  // 'YYYY-MM-DD'(주 시작) -> {dates:[...], data:{date:{끼니:[names]}}, at:확정시각}
+  S.skip=S.skip||[];            // '나중에 보기'한 메뉴
+  S.saved=S.saved||[];          // 보관함: 아직 안 쓴 한 상 조합 (통째 교체 검색엔 안 넣음 — 분리)
+  S.cleared=S.cleared||{};      // 모두빼기한 끼니의 복구용 스냅샷 (date|meal -> snap)
+  S.fix=S.fix||{};
+  S._ts=S._ts||{plan:{},confirmed:{},fix:{},cleared:{},saved:0,skip:0};
+  S._ts.plan=S._ts.plan||{};S._ts.confirmed=S._ts.confirmed||{};S._ts.fix=S._ts.fix||{};S._ts.cleared=S._ts.cleared||{};S._ts.saved=S._ts.saved||0;S._ts.skip=S._ts.skip||0;
+}
+function readViewStart(){try{return localStorage.getItem(VIEW_LS)||''}catch(e){return ''}}
+function rememberViewStart(v){S.start=v;try{localStorage.setItem(VIEW_LS,v)}catch(e){}}
+function sharedState(){
+  const out=JSON.parse(JSON.stringify(S));
+  delete out.start;             // 날짜 보기 위치는 Firebase에 올리지 않는다
+  return out;
+}
+function backupState(reason,state){
+  try{
+    const src=state||S;
+    if(!src||!src.plan)return;
+    const arr=JSON.parse(localStorage.getItem(BACKUP_LS)||'[]');
+    const snap=JSON.parse(JSON.stringify(src));
+    arr.push({at:Date.now(),reason:reason||'backup',state:snap});
+    localStorage.setItem(BACKUP_LS,JSON.stringify(arr.slice(-30)));
+  }catch(e){}
+}
+function backupStoredState(reason){
+  try{
+    const raw=localStorage.getItem(LS);
+    if(raw)backupState(reason,JSON.parse(raw));
+  }catch(e){}
+}
+function applyFixesToMenu(){
+  S.fix=S.fix||{};
+  Object.keys(S.fix).forEach(n=>{if(MENU[n])Object.assign(MENU[n],S.fix[n],{flag:false})});
+}
+let STATE_LAST=null;
+function stateClone(v){return JSON.parse(JSON.stringify(v==null?null:v));}
+function statePlanKeys(plan){
+  const out={};Object.keys(plan||{}).forEach(d=>{Object.keys(plan[d]||{}).forEach(m=>{out[d+'|'+m]=1;});});return out;
+}
+function stateSnapshot(){return {plan:stateClone(S.plan),confirmed:stateClone(S.confirmed),fix:stateClone(S.fix),cleared:stateClone(S.cleared),saved:stateClone(S.saved),skip:stateClone(S.skip)};}
+function stateSame(a,b){return JSON.stringify(a)==JSON.stringify(b);}
+function stateMapDiff(kind,now,prev,at){
+  const keys={};Object.keys(now||{}).forEach(k=>keys[k]=1);Object.keys(prev||{}).forEach(k=>keys[k]=1);
+  Object.keys(keys).forEach(k=>{if(!stateSame((now||{})[k],(prev||{})[k]))S._ts[kind][k]=at;});
+}
+function stateStampDiff(){
+  normalizeState();const now=stateSnapshot(),prev=STATE_LAST||{plan:{},confirmed:{},fix:{},cleared:{},saved:[],skip:[]},at=Date.now();
+  const pk=statePlanKeys(now.plan),ppk=statePlanKeys(prev.plan),keys={};Object.assign(keys,pk,ppk);
+  Object.keys(keys).forEach(k=>{
+    const [d,m]=k.split('|');
+    const nv=(now.plan[d]||{})[m],pv=(prev.plan[d]||{})[m];
+    if(!stateSame(nv,pv))S._ts.plan[k]=at;
+  });
+  stateMapDiff('confirmed',now.confirmed,prev.confirmed,at);
+  stateMapDiff('fix',now.fix,prev.fix,at);
+  stateMapDiff('cleared',now.cleared,prev.cleared,at);
+  if(!stateSame(now.saved,prev.saved))S._ts.saved=at;
+  if(!stateSame(now.skip,prev.skip))S._ts.skip=at;
+  STATE_LAST=stateClone(now);
+}
+function remoteCell(remotePlan,k){
+  const [d,m]=k.split('|');
+  return remotePlan&&remotePlan[d]&&Object.prototype.hasOwnProperty.call(remotePlan[d],m)?stateClone(remotePlan[d][m]):undefined;
+}
+function mergeRemoteMap(kind,target,remoteMap,remoteTs){
+  remoteMap=remoteMap||{};remoteTs=remoteTs||{};const keys={};Object.keys(remoteMap).forEach(k=>keys[k]=1);Object.keys(remoteTs).forEach(k=>keys[k]=1);Object.keys(S._ts[kind]||{}).forEach(k=>keys[k]=1);
+  Object.keys(keys).forEach(k=>{
+    const rt=+remoteTs[k]||0,lt=+S._ts[kind][k]||0;
+    if(rt>lt){if(Object.prototype.hasOwnProperty.call(remoteMap,k))target[k]=stateClone(remoteMap[k]);else delete target[k];S._ts[kind][k]=rt;}
+  });
+}
+function mergeRemoteState(remote,keepStart){
+  if(!remote||!remote._ts){applyRemoteState(remote,keepStart);return;}
+  backupState('before-remote-merge',S);
+  normalizeState();remote.plan=remote.plan||{};remote.confirmed=remote.confirmed||{};remote.fix=remote.fix||{};remote.cleared=remote.cleared||{};
+  const rts=remote._ts||{},planTs=rts.plan||{},planKeys={};Object.keys(planTs).forEach(k=>planKeys[k]=1);Object.keys(statePlanKeys(remote.plan)).forEach(k=>planKeys[k]=1);Object.keys(S._ts.plan||{}).forEach(k=>planKeys[k]=1);
+  Object.keys(planKeys).forEach(k=>{
+    const rt=+planTs[k]||0,lt=+S._ts.plan[k]||0;
+    if(rt>lt){
+      const [d,m]=k.split('|'),cell=remoteCell(remote.plan,k);
+      S.plan[d]=S.plan[d]||{};
+      if(cell===undefined)delete S.plan[d][m]; else S.plan[d][m]=cell;
+      if(S.plan[d]&&!Object.keys(S.plan[d]).length)delete S.plan[d];
+      S._ts.plan[k]=rt;
+    }
+  });
+  mergeRemoteMap('confirmed',S.confirmed,remote.confirmed,rts.confirmed);
+  mergeRemoteMap('fix',S.fix,remote.fix,rts.fix);
+  mergeRemoteMap('cleared',S.cleared,remote.cleared,rts.cleared);
+  if((+rts.saved||0)>(+S._ts.saved||0)){S.saved=stateClone(remote.saved||[]);S._ts.saved=+rts.saved||Date.now();}
+  if((+rts.skip||0)>(+S._ts.skip||0)){S.skip=stateClone(remote.skip||[]);S._ts.skip=+rts.skip||Date.now();}
+  S.updatedAt=Math.max(S.updatedAt||0,remote.updatedAt||0);S.planLogicVer=PLAN_LOGIC_VER;S.start=keepStart||readViewStart()||null;
+  applyFixesToMenu();try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){};STATE_LAST=stateSnapshot();
+}
+function applyRemoteState(remote,keepStart){
+  backupState('before-remote-apply',S);
+  S=remote||{};
+  normalizeState();
+  S.planLogicVer=PLAN_LOGIC_VER;
+  S.start=keepStart||readViewStart()||null;
+  applyFixesToMenu();
+  STATE_LAST=stateSnapshot();
+}
+function menuEditing(){
+  const _sh=document.getElementById('sheet'), _oov=document.getElementById('oov');
+  return (_sh&&_sh.classList.contains('on'))
+    || (_oov&&_oov.classList.contains('on'))
+    || (document.activeElement && /TEXTAREA|INPUT/.test(document.activeElement.tagName));
+}
+function applyPendingRemoteState(){
+  if(!pendingRemoteState||menuEditing())return;
+  const r=pendingRemoteState;pendingRemoteState=null;
+  fbApplying=true;
+  const _keepStart=S.start;
+  mergeRemoteState(r,_keepStart);
+  try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
+  fbApplying=false;
+  if(typeof render==='function'){buildPeriod(S.start);render()}
+}
+normalizeState();
+S.start=readViewStart()||null;        // 예전 공유 start 값은 믿지 않고, 이 기기의 보기 위치만 사용
 // 로직 버전이 바뀌어도 사용자가 짠 식단은 절대 비우지 않는다 (확정·작성 중인 것 보존).
 // 버전은 기록만 갱신. 빈 칸은 buildPeriod가 알아서 채우고, 이미 있는 칸은 그대로 둔다.
 if(S.planLogicVer!==PLAN_LOGIC_VER){
   S.planLogicVer=PLAN_LOGIC_VER;
 }
+STATE_LAST=stateSnapshot();
 let saveTimer=null;
 let lastLocalSave=0;
 const save=()=>{
+  backupStoredState('before-save');
+  stateStampDiff();
   lastLocalSave=Date.now();
   S.planLogicVer=PLAN_LOGIC_VER;
   S.updatedAt=Date.now();          // 저장 시각 — 충돌 시 더 최근 것이 이긴다
@@ -383,7 +531,7 @@ const save=()=>{
   // Firebase에도 저장 (잠깐 모아서 한 번에 — 너무 자주 쓰지 않게)
   if(FB_ON && fbReady && fbRef && !fbApplying){
     clearTimeout(saveTimer);
-    saveTimer=setTimeout(()=>{ try{ fbRef.set(S) }catch(e){} }, 400);
+    saveTimer=setTimeout(()=>{ try{ fbRef.set(sharedState()) }catch(e){} }, 400);
   }
 };
 /* Firebase 시작 — 키가 있을 때만. 최신 데이터를 받아와 화면 갱신, 이후 실시간 동기화 */
@@ -394,38 +542,34 @@ function initFirebase(){
     fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
     fbRef.once('value').then(snap=>{
       const remote=snap.val();
-      const localTime=S.updatedAt||0;
-      const remoteTime=(remote&&remote.updatedAt)||0;
       const remoteHasPlan = remote && remote.plan && Object.keys(remote.plan).length;
       const localHasPlan = S.plan && Object.keys(S.plan).length;
-      // 원격이 내 것보다 최신이고 식단이 있으면 원격 사용. 아니면 내 것을 유지(필요시 올림)
-      if(remoteHasPlan && (remoteTime>=localTime || !localHasPlan)){
+      const keepStart=S.start;
+      // 공유 모드에서는 Firebase를 기준으로 시작한다. 로컬의 오래된 updatedAt이 원격을 덮지 못하게 한다.
+      if(remoteHasPlan){
         fbApplying=true;
-        S=remote;
-        S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
-        S.planLogicVer=PLAN_LOGIC_VER;
+        mergeRemoteState(remote,keepStart);
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
-      }else if(localHasPlan){
-        // 내 것이 더 최신(또는 원격이 비었음) → 내 것을 올려 보존
-        try{ fbRef.set(S) }catch(e){}
+      }else if(localHasPlan && S.updatedAt){
+        // 원격이 정말 비어 있을 때만 내 데이터를 올린다.
+        try{ fbRef.set(sharedState()) }catch(e){}
       }
       fbReady=true;
       // 이후 다른 직원이 바꾸면 실시간 반영 — 단, 내 것보다 오래된 데이터는 무시
       fbRef.on('value', snap2=>{
         if(fbApplying) return;
-        if(Date.now()-lastLocalSave < 2500) return;   // 내가 방금 올린 메아리는 무시
         const r=snap2.val(); if(!r||!r.plan) return;
         if((r.updatedAt||0) < (S.updatedAt||0)) return;  // 받은 게 내 것보다 오래됐으면 무시(옛 데이터가 새 걸 덮지 않게)
-        // 사용자가 입력 중이면(모달 열림 / 입력 포커스) 데이터만 갱신하고 화면은 건드리지 않음
-        const editing = (document.getElementById('sheet')&&document.getElementById('sheet').classList.contains('on'))
-                        || (document.activeElement && /TEXTAREA|INPUT/.test(document.activeElement.tagName));
+        // 사용자가 수정 중이면(식단 모달 / 발주 모달 / 입력 포커스) 원격 적용 자체를 미룬다 — 작업 중인 식단이 덮어써지지 않게
+        if(menuEditing()){pendingRemoteState=r;return;}
         fbApplying=true;
-        S=r;S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
+        var _keepStart=S.start;
+        mergeRemoteState(r,_keepStart);   // 보던 주는 각자 유지 — 원격이 다른 주로 끌고가 날짜가 뒤로 넘어가지 않게
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
-        if(!editing && typeof render==='function'){buildPeriod(S.start);render()}
+        if(typeof render==='function'){buildPeriod(S.start);render()}
       });
     }).catch(()=>{ fbReady=false; });
   }catch(e){ /* 키가 잘못됐어도 localStorage로 계속 작동 */ }
@@ -705,7 +849,7 @@ function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){co
 function render(){
   if(!S.start)S.start=monday(iso(new Date()));
   const topStart=addDays(S.start,-7);          // 위 = 직전 주(참고)
-  buildPeriod(topStart);absorbPlan();save();
+  buildPeriod(topStart);absorbPlan();          // 화면 그리기는 저장하지 않는다
   const dates=periodDates(topStart);           // 위(직전)부터 2주 = 직전 주 + 짜는 주
   document.getElementById('perLabel').textContent=fmt(S.start)+' ~ '+fmt(addDays(S.start,5))+' 짜는 중';
   updateStockBtn();
@@ -774,6 +918,7 @@ function cellHtml(date,meal,badset){
   by.후식.forEach(it=>{h+='<div class="it">'+esc(it.n)+'</div>'});
   return h+'</div>';
 }
+function tasteBadge(n){const sl=slotOf(n);if(sl!=='메인'&&sl!=='국'&&sl!=='반찬')return '';const t=tasteOf(n);if(!t)return '';return '<span class="tbadge t'+t+'">'+t+'</span>';}
 function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 
 /* ===== 편집 시트 (빨간 칸 누르면 여기 하나로) ===== */
@@ -833,10 +978,15 @@ function openSheet(date,meal){
   render();
 }
 function closeSheet(){
+  const hadDirty=_boardDirty;
   if(S.plan&&S.plan['__stock__']){delete S.plan['__stock__'];S._draft=null;}
   if(stockMode&&cur&&cur.stock){cur=null;drawStock();render();return;}  // 한 상 만들다 닫으면 보관함 목록으로
   stockMode=false;cur=null;_boardDirty=false;document.getElementById('scrim').classList.remove('on');
-  document.getElementById('sheet').classList.remove('on');render()}
+  document.getElementById('sheet').classList.remove('on');
+  if(hadDirty)save();             // 저장 버튼 없이 닫아도 마지막 상태를 확정 저장
+  render();
+  applyPendingRemoteState();
+}
 function openGuide(){
   cur=null;
   document.getElementById('shTitle').textContent='이 프로그램의 기준';
@@ -993,7 +1143,7 @@ function drawSheet(){
     const opened=replaceIdx===i;
     h+='<div class="crow'+(sl==='메인'?' main':'')+(b?' badrow':'')+'">'
       +'<span class="cslot">'+sl+'</span>'
-      +'<span class="nm'+(b?' bad':'')+'" onclick="toggleAlgEdit('+i+')">'+esc(stripBox(it.n))
+      +'<span class="nm'+(b?' bad':'')+'" onclick="toggleAlgEdit('+i+')">'+tasteBadge(it.n)+esc(stripBox(it.n))
       +(a?' <span class="algnum">'+a+'</span>':'')+'</span>'
       +'<span class="crowbtns">'
       +'<button class="mini'+(opened?' on':'')+'" onclick="toggleReplace('+i+')">교체</button>'
@@ -1008,6 +1158,15 @@ function drawSheet(){
         h+='<button class="algchip'+(on?' on':'')+'" onclick="setItemSlot('+i+',\''+s+'\')">'+s+'</button>';
       });
       h+='</div>';
+      const _tsl=slotOf(it.n);
+      if(_tsl==='메인'||_tsl==='국'||_tsl==='반찬'){
+        const _ct=tasteOf(it.n);
+        h+='<div class="alglab">맛 <span class="alglab-sub">· 하나만</span></div><div class="algrow">';
+        ['매움','간장','기름','담백'].forEach(t=>{
+          h+='<button class="tchip t'+t+(_ct===t?' on':'')+'" onclick="setItemTaste('+i+',\''+t+'\')">'+t+'</button>';
+        });
+        h+='</div>';
+      }
       // 주재료는 프로그램이 자동 관리(재료중복 판정용) — 조리장 화면엔 안 보임
       h+='<div class="alglab">알레르기</div><div class="algrow">';
       for(let num=1;num<=19;num++){
@@ -1254,7 +1413,7 @@ function drawMealFind(){
   const q=((document.getElementById('mealFind')||{}).value||'').trim();window._mq=q;
   const el=document.getElementById('mealRes');if(!el)return;
   if(!q){el.innerHTML='';return}
-  const seen={};const hits=[];const dupHead={};
+  const seen={};let hits=[];const dupHead={};
   Object.keys(MEALIDX).forEach(name=>{
     if(!(name.includes(q)||cho(name).includes(q)))return;
     MEALIDX[name].forEach(rec=>{
@@ -1264,6 +1423,7 @@ function drawMealFind(){
   });
   if(!hits.length){el.innerHTML='<div class="empty-note">그 메뉴가 든 지난 끼니가 없어요.</div>';return}
   hits.sort((a,b)=>a.date<b.date?1:-1);
+  hits=prioritizeSearchList(hits,q,rec=>rec.items||[]);
   // 현재 끼니의 메인 (겹침 제외용)
   const curMains=new Set(cur?((S.plan[cur.date]&&S.plan[cur.date][cur.meal]&&S.plan[cur.date][cur.meal].items)||[]).filter(x=>slotOf(x.n)==='메인').map(x=>x.n):[]);
   // 최근 2주 + 이번 2주에 쓴 메인 → 도돌이표 방지로 제외
@@ -1298,6 +1458,26 @@ function drawMealFind(){
 /* 검색 */
 const CHO='ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ';
 const cho=s=>[...String(s)].map(ch=>{const c=ch.charCodeAt(0);return c>=44032&&c<=55203?CHO[Math.floor((c-44032)/588)]:ch}).join('');
+function searchRankName(name,q){
+  name=String(name||'');q=String(q||'').trim();
+  if(!q)return 9;
+  if(name===q)return 0;
+  if(name.startsWith(q))return 1;
+  if(name.includes(q))return 2;
+  const c=cho(name),cq=cho(q);
+  if(c===cq)return 3;
+  if(c.startsWith(cq))return 4;
+  if(c.includes(cq))return 5;
+  return 9;
+}
+function prioritizeSearchList(list,q,getNames){
+  if(!q)return list;
+  return list.map((item,idx)=>{
+    let names=getNames?getNames(item):item.name;
+    if(!Array.isArray(names))names=[names];
+    return {item,idx,rank:Math.min(...names.map(n=>searchRankName(n,q)))};
+  }).sort((a,b)=>a.rank-b.rank||a.idx-b.idx).map(x=>x.item);
+}
 function setFindSlot(s){findSlot=s;window._fq='';drawSheet()}
 function drawFind(){
   const q=(document.getElementById('findIn')||{}).value||'';window._fq=q.trim();
@@ -1315,6 +1495,7 @@ function drawFind(){
     if(a._last!==b._last)return a._last<b._last?-1:1;
     return (b.cnt||0)-(a.cnt||0);
   });
+  list=prioritizeSearchList(list,window._fq,m=>m.name);
   const el=document.getElementById('findRes');
   if(noQuery){el.innerHTML='';el.classList.remove('searching');const nw=document.getElementById('findNew');if(nw)nw.innerHTML='';return}
   list=list.slice(0,30);   // 검색하면 30개까지
@@ -1366,7 +1547,13 @@ function setItemSlot(i,label){
   S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{slot:real});
   save();drawSheet();markDirty();
 }
-/* 주재료 검색 — 사전(MAIN_ING_DICT)에서 찾고, 없으면 입력값 그대로 추가 가능 */
+function setItemTaste(i,taste){
+  const it=S.plan[cur.date][cur.meal].items[i];if(!it)return;
+  if(!MENU[it.n])MENU[it.n]={name:it.n,slot:'메인',alg:'',cnt:0,ing:'기타',taste:taste,tier:'B',flag:false};
+  else MENU[it.n].taste=taste;
+  S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{taste:taste});
+  save();drawSheet();markDirty();
+}
 function drawMingFind(i){
   const inp=document.getElementById('mingin'+i);const q=(inp&&inp.value||'').trim();
   const el=document.getElementById('mingres'+i);if(!el)return;
@@ -1491,7 +1678,7 @@ function undo(){if(!lastAct)return;S.plan[lastAct.date][lastAct.meal]=JSON.parse
   lastAct=null;save();if(cur)drawSheet();render();document.getElementById('toast').style.display='none'}
 
 /* 기간 이동 / 다시 채우기 */
-function move(n){S.start=addDays(S.start,n*7);save();render()}
+function move(n){rememberViewStart(addDays(S.start,n*7));render()}
 function resetToRef(){
   if(!confirm('이 2주를 작년 같은 기간 식단으로 다시 채울까요? 지금 바꾼 내용은 사라집니다.'))return;
   periodDates(S.start).forEach(d=>{delete S.plan[d]});
@@ -1664,7 +1851,7 @@ function openQuiz(){S.quizOpen=true;quizStep='slot';save();renderQuiz();
 
 /* ===== 시작 ===== */
 /* 6/15 주 실제 식단은 누적 데이터(data3yr)에 들어있음 — 시작 주만 6/22로 두면 위에 직전 주(6/15)가 보임 */
-if(!S.start)S.start=monday('2026-06-22');
+if(!S.start)rememberViewStart(monday('2026-06-22'));
 render();renderQuiz();
 initFirebase();   // Firebase 키가 있으면 공유 모드로 동기화 시작 (없으면 아무 일 없음)
 
@@ -1674,16 +1861,43 @@ initFirebase();   // Firebase 키가 있으면 공유 모드로 동기화 시작
    ============================================================ */
 var ORD_VENDORS=['CJ','농림','트레이'];
 var ORD_RECIPE={}, ORD_ORDERED={}, ORD_CLEARED={}, ORD_QTY={};
+var ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},vendors:0};
+var ORD_LAST=null, ordFbRef=null, ordReady=false, ordApplying=false, ordSaveTimer=null, ordLastLocalSave=0, ordPendingRemote=null;
 try{var _or=localStorage.getItem('ord_recipe');if(_or)ORD_RECIPE=JSON.parse(_or);
     var _oo=localStorage.getItem('ord_ordered');if(_oo)ORD_ORDERED=JSON.parse(_oo);
     var _oc=localStorage.getItem('ord_cleared');if(_oc)ORD_CLEARED=JSON.parse(_oc);
     var _oq=localStorage.getItem('ord_qty');if(_oq)ORD_QTY=JSON.parse(_oq);
-    var _ov=localStorage.getItem('ord_vendors');if(_ov)ORD_VENDORS=JSON.parse(_ov);}catch(e){}
-function ordSave(){try{localStorage.setItem('ord_recipe',JSON.stringify(ORD_RECIPE));
+    var _ov=localStorage.getItem('ord_vendors');if(_ov)ORD_VENDORS=JSON.parse(_ov);
+    var _ot=localStorage.getItem('ord_ts');if(_ot)ORD_TS=JSON.parse(_ot);}catch(e){}
+function ordClone(v){return JSON.parse(JSON.stringify(v==null?null:v));}
+function ordNormTs(){ORD_TS=ORD_TS||{};['recipe','ordered','cleared','qty'].forEach(function(k){ORD_TS[k]=ORD_TS[k]||{};});ORD_TS.vendors=ORD_TS.vendors||0;}
+function ordSnapshotData(){return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),vendors:ordClone(ORD_VENDORS)};}
+function ordSame(a,b){return JSON.stringify(a)==JSON.stringify(b);}
+function ordStampMap(kind,now,prev,at){
+  var keys={};Object.keys(now||{}).forEach(function(k){keys[k]=1;});Object.keys(prev||{}).forEach(function(k){keys[k]=1;});
+  Object.keys(keys).forEach(function(k){if(!ordSame((now||{})[k],(prev||{})[k]))ORD_TS[kind][k]=at;});
+}
+function ordStampDiff(){
+  ordNormTs();var now=ordSnapshotData(),prev=ORD_LAST||{recipe:{},ordered:{},cleared:{},qty:{},vendors:[]},at=Date.now();
+  ordStampMap('recipe',now.recipe,prev.recipe,at);
+  ordStampMap('ordered',now.ordered,prev.ordered,at);
+  ordStampMap('cleared',now.cleared,prev.cleared,at);
+  ordStampMap('qty',now.qty,prev.qty,at);
+  if(!ordSame(now.vendors,prev.vendors))ORD_TS.vendors=at;
+  ORD_LAST=ordClone(now);
+}
+function ordWriteLocal(){try{localStorage.setItem('ord_recipe',JSON.stringify(ORD_RECIPE));
     localStorage.setItem('ord_ordered',JSON.stringify(ORD_ORDERED));
     localStorage.setItem('ord_cleared',JSON.stringify(ORD_CLEARED));
     localStorage.setItem('ord_qty',JSON.stringify(ORD_QTY));
-    localStorage.setItem('ord_vendors',JSON.stringify(ORD_VENDORS));}catch(e){}}
+    localStorage.setItem('ord_vendors',JSON.stringify(ORD_VENDORS));
+    localStorage.setItem('ord_ts',JSON.stringify(ORD_TS));}catch(e){}}
+function ordSharedState(){ordNormTs();return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),vendors:ordClone(ORD_VENDORS),ts:ordClone(ORD_TS),updatedAt:Date.now()};}
+function ordHasData(){return Object.keys(ORD_RECIPE).length||Object.keys(ORD_ORDERED).length||Object.keys(ORD_CLEARED).length||Object.keys(ORD_QTY).length;}
+function ordSave(){ordStampDiff();ordWriteLocal();ordLastLocalSave=Date.now();
+  if(FB_ON&&ordReady&&ordFbRef&&!ordApplying){clearTimeout(ordSaveTimer);ordSaveTimer=setTimeout(function(){try{ordFbRef.set(ordSharedState());}catch(e){}},400);}
+}
+ORD_LAST=ordSnapshotData();
 /* 수량은 날짜별로 따로 저장 (재료·업체·재고는 메뉴별 기억) */
 function ordQK(date,meal,menu,ing){return date+'|'+meal+'|'+menu+'|'+ing;}
 function ordQtyGet(date,meal,menu,ing){if(!ing)return '';var v=ORD_QTY[ordQK(date,meal,menu,ing)];return v==null?'':v;}
@@ -1707,26 +1921,89 @@ function ordVenColor(v){return v==='CJ'?'#2C6FB8':v==='농림'?'#1C8A6B':v==='�
       if(!vd)return;Object.keys(ORD_RECIPE).forEach(function(n){(ORD_RECIPE[n]||[]).forEach(function(r){if(!r.stock&&r.ing===ing&&!r.vendor){r.vendor=vd;ch=true;}});});});
       localStorage.removeItem('ord_ingven');}
   }catch(e){}
+  // 자동 시드(주재료만 박힌 빈 줄) 정리 — 메뉴 열기만 해도 박히던 흔적 제거. 1회만 실행(조리장 작업 보호)
+  try{if(!localStorage.getItem('ord_seedclean')){
+    Object.keys(ORD_RECIPE).forEach(function(n){
+      var mi=(MENU[n]&&MENU[n].mainIng)?String(MENU[n].mainIng):'';
+      if(!mi)return;
+      ORD_RECIPE[n]=ORD_RECIPE[n].filter(function(r){return !(r.ing===mi&&!r.vendor&&!r.stock);});
+    });
+    localStorage.setItem('ord_seedclean','1');ch=true;
+  }}catch(e){}
   if(ch)ordSave();
 })();
+function ordMergeMap(kind,target,remoteData,remoteTs){
+  ordNormTs();remoteData=remoteData||{};remoteTs=remoteTs||{};
+  var keys={};Object.keys(remoteData).forEach(function(k){keys[k]=1;});Object.keys(remoteTs).forEach(function(k){keys[k]=1;});Object.keys(ORD_TS[kind]||{}).forEach(function(k){keys[k]=1;});
+  Object.keys(keys).forEach(function(k){
+    var rt=+remoteTs[k]||0, lt=+ORD_TS[kind][k]||0;
+    if(rt>lt){
+      if(Object.prototype.hasOwnProperty.call(remoteData,k))target[k]=ordClone(remoteData[k]);
+      else delete target[k];
+      ORD_TS[kind][k]=rt;
+    }
+  });
+}
+function ordApplyLegacyRemote(r){
+  if(!r||!r.recipe)return false;
+  if(ordHasData())return false;
+  ORD_RECIPE=ordClone(r.recipe||{});ORD_ORDERED=ordClone(r.ordered||{});ORD_CLEARED=ordClone(r.cleared||{});ORD_QTY=ordClone(r.qty||{});ORD_VENDORS=ordClone(r.vendors||ORD_VENDORS);
+  var at=r.updatedAt||Date.now();ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},vendors:at};
+  Object.keys(ORD_RECIPE).forEach(function(k){ORD_TS.recipe[k]=at;});Object.keys(ORD_ORDERED).forEach(function(k){ORD_TS.ordered[k]=at;});Object.keys(ORD_CLEARED).forEach(function(k){ORD_TS.cleared[k]=at;});Object.keys(ORD_QTY).forEach(function(k){ORD_TS.qty[k]=at;});
+  ORD_LAST=ordSnapshotData();ordWriteLocal();return true;
+}
+function ordApplyRemote(r){
+  if(!r)return false;
+  if(!r.ts)return ordApplyLegacyRemote(r);
+  ordMergeMap('recipe',ORD_RECIPE,r.recipe,r.ts.recipe);
+  ordMergeMap('ordered',ORD_ORDERED,r.ordered,r.ts.ordered);
+  ordMergeMap('cleared',ORD_CLEARED,r.cleared,r.ts.cleared);
+  ordMergeMap('qty',ORD_QTY,r.qty,r.ts.qty);
+  if((+((r.ts||{}).vendors)||0)>(+ORD_TS.vendors||0)){ORD_VENDORS=ordClone(r.vendors||ORD_VENDORS);ORD_TS.vendors=+r.ts.vendors||Date.now();}
+  ORD_LAST=ordSnapshotData();ordWriteLocal();return true;
+}
+function ordEditing(){
+  var oov=document.getElementById('oov'),ovv=document.getElementById('ovv');
+  return (oov&&oov.classList.contains('on'))||(ovv&&ovv.classList.contains('on'))||(document.activeElement&&/TEXTAREA|INPUT/.test(document.activeElement.tagName));
+}
+function ordApplyPendingRemote(){
+  if(!ordPendingRemote||ordEditing())return;
+  var r=ordPendingRemote;ordPendingRemote=null;ordApplying=true;ordApplyRemote(r);ordApplying=false;
+  if(typeof ordRenderBoard==='function')ordRenderBoard();
+}
+function ordInitFirebase(){
+  if(!FB_ON||!window.firebase)return;
+  try{
+    ordFbRef=firebase.database().ref('menuplan_order');
+    ordFbRef.once('value').then(function(snap){
+      var r=snap.val();
+      ordApplying=true;
+      if(r&&r.recipe){ordApplyRemote(r);}
+      else if(ordHasData()){try{ordFbRef.set(ordSharedState());}catch(e){}}
+      ordApplying=false;ordReady=true;
+      ordFbRef.on('value',function(snap2){
+        if(ordApplying)return;
+        var rr=snap2.val();if(!rr)return;
+        if(ordEditing()){ordPendingRemote=rr;return;}
+        ordApplying=true;ordApplyRemote(rr);ordApplying=false;
+        if(typeof ordRenderBoard==='function')ordRenderBoard();
+      });
+    }).catch(function(){ordReady=false;});
+  }catch(e){}
+}
 var ordMain='week', ordModal=null, ordChipKey=null, ordVenTidy=false, ordPeriod='week', ordPF='', ordPT='', ordVenManage=false;
 
 function ordWeekDays(){var a=[];for(var i=0;i<6;i++)a.push(addDays(S.start,i));return a;}
 function ordMeals(){return ['점심','저녁'];}
 function ordDisp(n){return (typeof stripBox==='function')?stripBox(n):n;}
-function ordRecipeFor(name){
-  if(!ORD_RECIPE[name]){
-    var mi=(MENU[name]&&MENU[name].mainIng)?String(MENU[name].mainIng):'';
-    ORD_RECIPE[name]= mi?[{ing:mi,q:'',vendor:''}]:[];
-  }
-  return ORD_RECIPE[name];
-}
+function ordRecipeFor(name){return ORD_RECIPE[name]||[];}
 function ordSplitQ(q){var m=String(q||'').match(/^\s*([\d.]+)\s*(.*)$/);if(!m)return{num:null,unit:String(q||'').trim()};return{num:parseFloat(m[1]),unit:(m[2]||'').trim()};}
 function ordQstr(x){return x.hasNum?(x.num+(x.unit||'')):(x.unit||'');}
 
 /* ===== 주간 그리드 (식단표와 동일 .grid/.hd/.rl/.cell 재사용) ===== */
 function ordCell(date,meal){
-  var items=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[];
+  var raw=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[];
+  var items=ordSortItems(raw);
   var done=!!ORD_ORDERED[date+'|'+meal];
   var h='<div class="ocfmrow"><button class="ocfm'+(done?' done':'')+'" onclick="event.stopPropagation();ordToggleCell(\''+date+'\',\''+meal+'\')" title="재료담기 완료 표시 (다시 누르면 해제)">발주</button></div>';
   items.forEach(function(it){
@@ -1834,7 +2111,7 @@ function ordVendorHtml(){
   return h;
 }
 function ordOpenVendor(){ordVenManage=false;document.getElementById('ovv').classList.add('on');ordRenderVendor();}
-function ordCloseVendor(){document.getElementById('ovv').classList.remove('on');}
+function ordCloseVendor(){document.getElementById('ovv').classList.remove('on');ordApplyPendingRemote();}
 function ordRenderVendor(){
   var b=document.getElementById('ovvb');if(!b)return;
   document.getElementById('ovvh').innerHTML='<div class="ot2">업체</div><div class="ohrt"><button class="opmanage'+(ordVenManage?' on':'')+'" onclick="ordToggleVenManage()" title="업체 추가·삭제">업체 관리</button><button class="oprint" onclick="ordExportXlsx()" title="이 기간 발주 엑셀로 받기">엑셀</button><button class="ox" onclick="ordCloseVendor()">×</button></div>';
@@ -1868,8 +2145,15 @@ function ordFb(t){var ta=document.createElement('textarea');ta.value=t;document.
 
 /* ===== 발주 모달 (메뉴 읽기전용 + 재료 입력 + [완료]) ===== */
 function ordOpenModal(date,meal){ordModal={date:date,meal:meal};ordRenderModal();document.getElementById('oov').classList.add('on');}
-function ordCloseModal(){ordTrim();document.getElementById('oov').classList.remove('on');ordModal=null;ordSave();ordRenderBoard();}
-function ordItems(){return (ordModal&&S.plan[ordModal.date]&&S.plan[ordModal.date][ordModal.meal]&&S.plan[ordModal.date][ordModal.meal].items)||[];}
+function ordCloseModal(){ordTrim();document.getElementById('oov').classList.remove('on');ordModal=null;ordSave();ordApplyPendingRemote();ordRenderBoard();}
+function ordSortItems(raw){
+  var SO={'메인':0,'국':1,'반찬':2,'기본':3,'후식':4};
+  return raw.map(function(it,idx){return {it:it,idx:idx};}).sort(function(a,b){
+    var d=(SO[slotOf(a.it.n)]==null?9:SO[slotOf(a.it.n)])-(SO[slotOf(b.it.n)]==null?9:SO[slotOf(b.it.n)]);
+    return d!==0?d:a.idx-b.idx;
+  }).map(function(x){return x.it;});
+}
+function ordItems(){return ordSortItems((ordModal&&S.plan[ordModal.date]&&S.plan[ordModal.date][ordModal.meal]&&S.plan[ordModal.date][ordModal.meal].items)||[]);}
 function ordIsBlank(r){return !r.stock && !(r.ing&&String(r.ing).trim()) && !(r.q&&String(r.q).trim());}
 function ordTrim(){Object.keys(ORD_RECIPE).forEach(function(n){ORD_RECIPE[n]=ORD_RECIPE[n].filter(function(r){return !ordIsBlank(r);});});}
 function ordVenOpts(sel){var h='';ORD_VENDORS.forEach(function(v){h+='<option'+(v===sel?' selected':'')+'>'+esc(v)+'</option>';});h+='<option value="__add">+ 새 업체</option>';return h;}
@@ -1916,7 +2200,7 @@ function ordRenderModal(){
   });
   document.getElementById('oedb').innerHTML=h;
 }
-function ordRecOf(mi){var it=ordItems()[mi];if(!it)return null;return ordRecipeFor(it.n);}
+function ordRecOf(mi){var it=ordItems()[mi];if(!it)return null;if(!ORD_RECIPE[it.n])ORD_RECIPE[it.n]=[];return ORD_RECIPE[it.n];}
 function ordSetIng(mi,ii,v){var r=ordRecOf(mi);if(!r||!r[ii])return;r[ii].ing=v.trim();ordSave();
   var btn=document.getElementById('oven_'+mi+'_'+ii);
   if(btn&&!r[ii].stock){var ev=ordVenOf(r[ii]);var open=(ordChipKey===mi+':'+ii)?' open':'';btn.textContent=ev||'업체';btn.className='ovenslot'+(ev?'':' empty')+open;}
@@ -1952,12 +2236,15 @@ function ordToggleOrder(){if(!ordModal)return;var k=ordModal.date+'|'+ordModal.m
 function ordShow(view){
   var f=document.getElementById('otabFood'),o=document.getElementById('otabOrder');
   var weeks=document.getElementById('weeks'),ov=document.getElementById('orderview'),qc=document.getElementById('quizcard');
-  if(view==='order'){o.className='otab on';f.className='otab';weeks.style.display='none';if(qc)qc.style.display='none';ov.style.display='';ordRenderBoard();}
+  if(view==='order'){o.className='otab on';f.className='otab';weeks.style.display='none';if(qc)qc.style.display='none';ov.style.display='';ordApplyPendingRemote();ordRenderBoard();}
   else{f.className='otab on';o.className='otab';weeks.style.display='';ov.style.display='none';}
 }
 function ordSetMain(m){ordMain=m;ordRenderBoard();}
 /* 발주 뷰에서 ◀▶로 주간 이동 시 발주표도 함께 갱신 (식단 move는 그대로 호출) */
 if(typeof move==='function'){var __ordOrigMove=move;move=function(n){__ordOrigMove(n);var ov=document.getElementById('orderview');if(ov&&ov.style.display!=='none'){ordRenderBoard();}};}
+/* 식단 render가 돌 때(주간 변경·Firebase 동기화 등) 발주 보드도 같은 주로 따라가게 — 상단 기간과 보드가 어긋나는 것 방지 */
+if(typeof render==='function'){var __ordOrigRender=render;render=function(){__ordOrigRender();var ov=document.getElementById('orderview');if(ov&&ov.style.display!=='none'&&typeof ordRenderBoard==='function'){ordRenderBoard();}};}
+ordInitFirebase();
 var _ott;function ordToast(msg){var t=document.getElementById('otoast');if(!t){t=document.createElement('div');t.id='otoast';t.className='otoast';document.body.appendChild(t);}t.textContent=msg;t.classList.add('on');clearTimeout(_ott);_ott=setTimeout(function(){t.classList.remove('on');},1700);}
 
 </script>
