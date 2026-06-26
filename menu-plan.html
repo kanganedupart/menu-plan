@@ -33,6 +33,12 @@ font-size:14px;font-weight:700;cursor:pointer;color:var(--ink);font-family:inher
 .btn.solid:hover{background:var(--gd);color:#fff}
 .btn.ghost{border-color:transparent;color:var(--mut);padding:8px 11px}
 .btn.ghost:hover{border-color:var(--line);color:var(--gd)}
+.syncbadge{font-size:12px;font-weight:700;color:var(--mut);background:#F4F7F5;border:1px solid var(--line);
+border-radius:999px;padding:6px 10px;white-space:nowrap}
+.syncbadge.ok{color:var(--gd);background:var(--gbg);border-color:#BFD8CD}
+.syncbadge.busy{color:#7A642B;background:#FFF8E8;border-color:#EBD9A9}
+.syncbadge.bad{color:var(--red);background:var(--redbg);border-color:#E9C4BC}
+.syncbadge.warn{color:#8A5A13;background:#FFF6E6;border-color:#E9C98B}
 main{max-width:1180px;margin-left:max(0px,calc(100vw - 440px - 1180px - 24px));margin-right:auto;padding:18px 16px 80px}
 .note{font-size:13px;color:var(--mut);margin-bottom:14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .dotlg{display:inline-flex;align-items:center;gap:5px;font-size:12.5px;color:var(--mut)}
@@ -316,6 +322,7 @@ window.FIREBASE_CONFIG = {
 <button onclick="move(1)" aria-label="다음 2주">▶</button>
 </div>
 <div class="otabwrap"><button id="otabFood" class="otab on" onclick="ordShow('food')">식단</button><button id="otabOrder" class="otab" onclick="ordShow('order')">발주</button></div>
+<span id="syncBadge" class="syncbadge busy">공유 연결 중</span>
 <span class="spacer"></span>
 <button class="btn ghost" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관</button>
 <button class="btn ghost" onclick="openGuide()" title="이 프로그램이 어떻게 작동하는지 설명">기준</button>
@@ -350,12 +357,14 @@ const CORE_MENU_FIX={
   '후식':{slot:'후식',alg:'',ing:'기타',taste:'담백',tier:'B'},
   '요구르트':{slot:'후식',alg:'',ing:'기타',taste:'담백',tier:'B'}
 };
+const FORCE_MAIN_SLOT_RE=/제육|닭도리탕|닭볶음탕|찜닭|돈까스|돈가스|함박|갈비찜/;
 function ensureMenu(name, slot, alg){
   if(!name||MENU[name])return;
   MENU[name]={name,slot:slot||'반찬',alg:alg||'',cnt:0,ing:'기타',taste:inferMissingTaste(name),tier:'B',flag:false};
 }
 function inferMissingSlot(name){
   if(/^(흰밥|쌀밥|잡곡밥|현미밥|김치|깍두기|단무지|피클)$/.test(name))return '기본';
+  if(FORCE_MAIN_SLOT_RE.test(name))return '메인';
   if(/(국|탕|찌개|스프|육수)$/.test(name))return '국';
   if(/(후식|요구르트|요플레|음료|주스|과일|황도|귤|바나나|몽쉘|쿠키|카스타드)/.test(name))return '후식';
   return '반찬';
@@ -370,6 +379,12 @@ function enforceCoreMenus(){
   Object.keys(CORE_MENU_FIX).forEach(name=>{
     MENU[name]=Object.assign(MENU[name]||{name,cnt:0,flag:false},CORE_MENU_FIX[name],{name,flag:false});
     try{if(S&&S.fix)S.fix[name]=Object.assign(S.fix[name]||{},CORE_MENU_FIX[name]);}catch(e){}
+  });
+  Object.keys(MENU).forEach(name=>{
+    if(FORCE_MAIN_SLOT_RE.test(name)){
+      MENU[name].slot='메인';
+      try{if(S&&S.fix)S.fix[name]=Object.assign(S.fix[name]||{},{slot:'메인'});}catch(e){}
+    }
   });
 }
 ['김치','흰밥','깍두기','후식','요구르트'].forEach(n=>ensureMenu(n,inferMissingSlot(n),''));
@@ -403,10 +418,12 @@ const LS='bareun_v11';
 const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 각 기기에서만 기억
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
+const APP_BUILD='20260626_1810_save_guard'; // 배포 캐시/구버전 확인용
 // Firebase 설정 여부
 const FB_ON = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.databaseURL);
 let fbRef=null, fbReady=false, fbApplying=false;
 let pendingRemoteState=null;
+let appBooted=false, appUpdatePending=false, syncState='busy';
 // 먼저 localStorage로 빠르게 시작 (오프라인·키 없을 때도 작동)
 let S=JSON.parse(localStorage.getItem(LS)||'{}');
 function normalizeState(){
@@ -622,6 +639,82 @@ if(S.planLogicVer!==PLAN_LOGIC_VER){
 STATE_LAST=stateSnapshot();
 let saveTimer=null;
 let lastLocalSave=0;
+let saveInFlight=false;
+let saveQueued=false;
+let saveRetryTimer=null;
+function setSyncBadge(kind,msg){
+  syncState=kind||syncState;
+  const el=document.getElementById('syncBadge');
+  if(!el)return;
+  el.className='syncbadge '+(kind||'');
+  el.textContent=msg||'';
+}
+function showBootMessage(msg,bad){
+  const el=document.getElementById('weeks');
+  if(el)el.innerHTML='<div class="'+(bad?'warnsum on':'clean')+'">'+esc(msg)+'</div>';
+}
+function officialUrlWarning(){
+  if(location.protocol==='file:')return true;
+  if(location.hostname==='127.0.0.1'||location.hostname==='localhost')return true;
+  return location.hostname&&location.hostname!=='kanganedupart.github.io';
+}
+function bootRender(){
+  appBooted=true;
+  render();renderQuiz();
+  if(officialUrlWarning())setSyncBadge('warn','공식 주소 아님');
+  else if(FB_ON&&fbReady)setSyncBadge('ok','공유 저장됨');
+}
+function maybeReloadForUpdate(){
+  if(!appUpdatePending)return;
+  if(menuEditing()||saveInFlight||saveQueued)return;
+  setSyncBadge('warn','새 버전 적용 중');
+  flushSharedStateNow().finally(()=>setTimeout(()=>location.reload(),250));
+}
+function checkAppVersion(){
+  if(location.protocol==='file:'||!location.href||!window.fetch)return;
+  const url=location.origin+location.pathname+'?version='+Date.now();
+  fetch(url,{cache:'no-store'}).then(r=>r.text()).then(txt=>{
+    const m=txt.match(/const APP_BUILD='([^']+)'/);
+    if(m&&m[1]&&m[1]!==APP_BUILD){
+      appUpdatePending=true;
+      setSyncBadge('warn','새 버전 있음');
+      maybeReloadForUpdate();
+    }
+  }).catch(()=>{});
+}
+function flushSharedStateNow(){
+  if(!(FB_ON && fbReady && fbRef && !fbApplying))return Promise.resolve(false);
+  if(saveTimer){clearTimeout(saveTimer);saveTimer=null;}
+  if(saveInFlight){saveQueued=true;return Promise.resolve(false);}
+  saveInFlight=true;
+  setSyncBadge('busy','공유 저장 중');
+  let p;
+  try{p=writeSharedState()}catch(e){saveQueued=true;saveInFlight=false;setSyncBadge('bad','공유 저장 실패');return Promise.resolve(false)}
+  return Promise.resolve(p).catch(()=>{saveQueued=true;setSyncBadge('bad','공유 저장 실패');clearTimeout(saveRetryTimer);saveRetryTimer=setTimeout(()=>flushSharedStateNow(),3000);}).then(()=>{
+    saveInFlight=false;
+    if(saveQueued){
+      saveQueued=false;
+      setTimeout(()=>{try{flushSharedStateNow()}catch(e){}},50);
+    }else if(!appUpdatePending){
+      setSyncBadge(officialUrlWarning()?'warn':'ok',officialUrlWarning()?'공식 주소 아님':'공유 저장됨');
+    }
+    maybeReloadForUpdate();
+    return true;
+  });
+}
+function queueSharedStateWrite(){
+  if(!(FB_ON && fbReady && fbRef && !fbApplying)){saveQueued=true;return;}
+  if(saveTimer)clearTimeout(saveTimer);
+  saveTimer=setTimeout(()=>{saveTimer=null;flushSharedStateNow();},0);
+}
+function flushBeforeLeave(){
+  try{
+    stateRepairMissingTs(S,Date.now());
+    localStorage.setItem(LS,JSON.stringify(S));
+    flushSharedStateNow();
+    if(typeof ordFlushBeforeLeave==='function')ordFlushBeforeLeave();
+  }catch(e){}
+}
 const save=()=>{
   backupStoredState('before-save');
   stateStampDiff();
@@ -630,15 +723,25 @@ const save=()=>{
   S.planLogicVer=PLAN_LOGIC_VER;
   S.updatedAt=Date.now();          // 저장 시각 — 충돌 시 더 최근 것이 이긴다
   try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){toast('저장 공간이 가득 찼어요',false)}
-  // Firebase에도 저장 (잠깐 모아서 한 번에 — 너무 자주 쓰지 않게)
+  // Firebase에도 바로 저장 큐에 올림. 창을 닫기 직전 저장이 밀리지 않게 지연을 최소화한다.
   if(FB_ON && fbReady && fbRef && !fbApplying){
-    clearTimeout(saveTimer);
-    saveTimer=setTimeout(()=>{ try{ writeSharedState() }catch(e){} }, 400);
+    queueSharedStateWrite();
+  }else if(FB_ON){
+    saveQueued=true;
+    setSyncBadge('busy','공유 연결 중');
   }
 };
+window.addEventListener('pagehide',flushBeforeLeave);
+window.addEventListener('beforeunload',flushBeforeLeave);
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='hidden')flushBeforeLeave();
+  else{applyPendingRemoteState();maybeReloadForUpdate();}
+});
 /* Firebase 시작 — 키가 있을 때만. 최신 데이터를 받아와 화면 갱신, 이후 실시간 동기화 */
 function initFirebase(){
   if(!FB_ON) return;
+  setSyncBadge('busy','공유 연결 중');
+  showBootMessage('공유 식단을 불러오는 중입니다. 잠시만 기다려 주세요.');
   try{
     firebase.initializeApp(window.FIREBASE_CONFIG);
     fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
@@ -654,13 +757,16 @@ function initFirebase(){
         applyRemoteState(remote,keepStart);
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
-        if(typeof render==='function'){buildPeriod(S.start);render()}
         if(remoteRepaired){setTimeout(()=>{try{writeSharedState()}catch(e){}},800)}
       }else if(localHasPlan && S.updatedAt){
         // 원격이 정말 비어 있을 때만 내 데이터를 올린다.
         try{ writeSharedState() }catch(e){}
       }
       fbReady=true;
+      if(saveQueued){saveQueued=false;queueSharedStateWrite();}
+      bootRender();
+      setTimeout(checkAppVersion,1500);
+      setInterval(checkAppVersion,300000);
       // 이후 다른 직원이 바꾸면 실시간 반영 — 단, 내 것보다 오래된 데이터는 무시
       fbRef.on('value', snap2=>{
         if(fbApplying) return;
@@ -677,8 +783,8 @@ function initFirebase(){
         if(typeof render==='function'){buildPeriod(S.start);render()}
         if(remoteRepaired){setTimeout(()=>{try{writeSharedState()}catch(e){}},800)}
       });
-    }).catch(()=>{ fbReady=false; });
-  }catch(e){ /* 키가 잘못됐어도 localStorage로 계속 작동 */ }
+    }).catch(()=>{ fbReady=false;setSyncBadge('bad','공유 연결 실패');showBootMessage('공유 저장소 연결에 실패했습니다. 인터넷 연결을 확인한 뒤 새로고침해 주세요.',true); });
+  }catch(e){ fbReady=false;setSyncBadge('bad','공유 연결 실패');showBootMessage('공유 저장소 연결에 실패했습니다. 인터넷 연결을 확인한 뒤 새로고침해 주세요.',true); }
 }
 /* 조리장이 짠 식단을 검색·위험군·끌어오기 풀에 누적 (원본 3년치는 안 건드림) */
 function absorbPlan(){
@@ -1043,10 +1149,12 @@ function render(){
 function sunCell(date,meal){
   const its=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[];
   const txt=its.map(it=>stripBox(it.n)).join('\n');
+  const syncWait=(FB_ON&&!fbReady)?' disabled title="공유 저장 연결 중입니다. 잠시 후 입력하세요"':'';
   return '<div class="cell sunbox-cell"><textarea class="sunta" placeholder="도시락 적기&#10;(한 줄에 하나)" '
-    +'oninput="sunEdit(this,\''+date+'\',\''+meal+'\')">'+esc(txt)+'</textarea></div>';
+    +'oninput="sunEdit(this,\''+date+'\',\''+meal+'\')"'+syncWait+'>'+esc(txt)+'</textarea></div>';
 }
 function sunEdit(ta,date,meal){
+  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 입력하세요',false);return}
   const lines=ta.value.split('\n').map(s=>s.trim()).filter(Boolean);
   S.plan[date]=S.plan[date]||{};
   S.plan[date][meal]={items:lines.map(n=>({n}))};
@@ -1080,11 +1188,13 @@ let algEditIdx=-1;   // 현재 알레르기 편집 중인 항목 index
 /* ===== 자리 바꾸기 (집고 놓기) ===== */
 let swapFrom=null;  // {date,meal}
 function pickSwap(date,meal){
+  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(swapFrom&&swapFrom.date===date&&swapFrom.meal===meal){swapFrom=null;render();return} // 같은 칸 다시 누르면 취소
   swapFrom={date,meal};render();
   toast(fmt(date)+' '+meal+' 을(를) 옮길 곳을 누르세요 (같은 '+meal+'끼리만)',false);
 }
 function cellClick(date,meal){
+  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(swapFrom){
     if(swapFrom.date===date&&swapFrom.meal===meal){swapFrom=null;render();return}
     if(swapFrom.meal!==meal){toast(meal+'은 '+swapFrom.meal+'끼리만 바꿀 수 있어요',false);return}
@@ -1835,6 +1945,7 @@ function undo(){if(!lastAct)return;S.plan[lastAct.date][lastAct.meal]=JSON.parse
 /* 기간 이동 / 다시 채우기 */
 function move(n){rememberViewStart(addDays(S.start,n*7));render()}
 function resetToRef(){
+  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(!confirm('이 2주를 작년 같은 기간 식단으로 다시 채울까요? 지금 바꾼 내용은 사라집니다.'))return;
   periodDates(S.start).forEach(d=>{delete S.plan[d]});
   buildPeriod(S.start);save();render();
@@ -1870,6 +1981,7 @@ function restoreData(ev){
 }
 // 한 주(시작 월요일 ws)의 식단을 확정본으로 저장(덮어쓰기 = 수정)
 function confirmWeek(ws){
+  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return false}
   // 이미 확정된 주에서 다시 누르면 → 확정 표시만 해제(하양). 식단은 그대로 둠.
   if(S.confirmed[ws]){
     delete S.confirmed[ws];
@@ -2007,8 +2119,12 @@ function openQuiz(){S.quizOpen=true;quizStep='slot';save();renderQuiz();
 /* ===== 시작 ===== */
 /* 6/15 주 실제 식단은 누적 데이터(data3yr)에 들어있음 — 시작 주만 6/22로 두면 위에 직전 주(6/15)가 보임 */
 if(!S.start)rememberViewStart(monday('2026-06-22'));
-render();renderQuiz();
-initFirebase();   // Firebase 키가 있으면 공유 모드로 동기화 시작 (없으면 아무 일 없음)
+if(FB_ON){
+  initFirebase();   // 공유 모드에서는 Firebase 최신값을 먼저 받은 뒤 화면을 연다.
+}else{
+  fbReady=true;
+  bootRender();
+}
 
 /* ============================================================
    발주 모듈 (식단 코드 비침범 — ord 접두어로 전부 분리)
@@ -2102,6 +2218,30 @@ function ordWriteSharedState(){
   if(ordFbRef.transaction){return ordFbRef.transaction(function(current){return ordMergeLocalIntoRemote(current||{},local);},function(){},false);}
   return ordFbRef.set(local);
 }
+var ordSaveInFlight=false, ordSaveQueued=false, ordSaveRetryTimer=null;
+function ordFlushSharedStateNow(){
+  if(!(FB_ON&&ordReady&&ordFbRef&&!ordApplying))return Promise.resolve(false);
+  if(ordSaveTimer){clearTimeout(ordSaveTimer);ordSaveTimer=null;}
+  if(ordSaveInFlight){ordSaveQueued=true;return Promise.resolve(false);}
+  ordSaveInFlight=true;setSyncBadge('busy','공유 저장 중');
+  var p;
+  try{p=ordWriteSharedState();}catch(e){ordSaveQueued=true;ordSaveInFlight=false;setSyncBadge('bad','공유 저장 실패');return Promise.resolve(false);}
+  return Promise.resolve(p).catch(function(){ordSaveQueued=true;setSyncBadge('bad','공유 저장 실패');clearTimeout(ordSaveRetryTimer);ordSaveRetryTimer=setTimeout(function(){ordFlushSharedStateNow();},3000);}).then(function(){
+    ordSaveInFlight=false;
+    if(ordSaveQueued){ordSaveQueued=false;setTimeout(function(){ordFlushSharedStateNow();},50);}
+    else if(!saveInFlight&&!saveQueued&&!appUpdatePending)setSyncBadge(officialUrlWarning()?'warn':'ok',officialUrlWarning()?'공식 주소 아님':'공유 저장됨');
+    maybeReloadForUpdate();
+    return true;
+  });
+}
+function ordQueueSharedStateWrite(){
+  if(!(FB_ON&&ordReady&&ordFbRef&&!ordApplying)){ordSaveQueued=true;return;}
+  if(ordSaveTimer)clearTimeout(ordSaveTimer);
+  ordSaveTimer=setTimeout(function(){ordSaveTimer=null;ordFlushSharedStateNow();},0);
+}
+function ordFlushBeforeLeave(){
+  try{ordWriteLocal();ordFlushSharedStateNow();}catch(e){}
+}
 function ordHasData(){return Object.keys(ORD_RECIPE).length||Object.keys(ORD_ORDERED).length||Object.keys(ORD_CLEARED).length||Object.keys(ORD_QTY).length||Object.keys(ORD_PRICE).length||Object.keys(ORD_LEARN).length;}
 function ordRemoteHasData(r){
   if(!r)return false;
@@ -2110,7 +2250,8 @@ function ordRemoteHasData(r){
     || (r.cost&&Object.keys(r.cost).length);
 }
 function ordSave(){ordStampDiff();ordWriteLocal();ordLastLocalSave=Date.now();
-  if(FB_ON&&ordReady&&ordFbRef&&!ordApplying){clearTimeout(ordSaveTimer);ordSaveTimer=setTimeout(function(){try{ordWriteSharedState();}catch(e){}},400);}
+  if(FB_ON&&ordReady&&ordFbRef&&!ordApplying)ordQueueSharedStateWrite();
+  else if(FB_ON){ordSaveQueued=true;setSyncBadge('busy','공유 연결 중');}
 }
 ORD_LAST=ordSnapshotData();
 /* 수량은 날짜별로 따로 저장 (재료·업체·재고는 메뉴별 기억) */
@@ -2268,6 +2409,7 @@ function ordInitFirebase(){
       if(hasRemote){repaired=ordApplyRemoteAuthority(r);}
       else if(ordHasData()){try{ordWriteSharedState();}catch(e){}}
       ordApplying=false;ordReady=true;
+      if(ordSaveQueued){ordSaveQueued=false;ordQueueSharedStateWrite();}
       if(repaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
       ordFbRef.on('value',function(snap2){
         if(ordApplying)return;
