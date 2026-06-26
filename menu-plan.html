@@ -699,14 +699,48 @@ const ING_DUP_SKIP=new Set(['돼지','소','닭','오리','야채','기타']);  
 const BREAKFAST_BASE=['시리얼','우유','김치'];   // 조식 기본(자동) — 삭제만 가능, 나머지는 검색해서 채움
 const BASE=new Set(['흰밥','김치','깍두기','단무지','쌈장','초간장','피클','김','쌈무','열무김치','후리가케','사조김','흑미밥','흰밥·후리가케','양파절임','오복지','깻잎지','무말랭이','파절이']);
 function slotOf(n){const m=MENU[n];return m?m.slot:'메인'}
+const MAIN_FORCE_RE=/제육|닭도리|닭볶음|닭갈비|불고기|돈까스|돈가스|까스|탕수|강정|튀김|구이|볶음|조림|찜|스테이크|함박|갈비|수육|보쌈|오리|두루치기|돈육장조림|모듬장조림|소고기장조림|쇠고기장조림|떡갈비|치킨|너겟|유린기|카레|짜장|하이라이스|덮밥|볶음밥|마파두부|깐풍|라조기|폭찹|동그랑땡|잡채/;
+const MAIN_SOUP_RE=/닭도리탕|닭볶음탕|감자탕|갈비탕|설렁탕|육개장|해장국|국밥|추어탕|삼계탕/;
+const SOUP_RE=/국|탕|찌개|스프|수프|미소|된장|미역/;
+const SIDE_RE=/무침|나물|샐러드|김치|깍두기|피클|단무지|장아찌|쌈|콩자반|멸치|진미채|오복지|마늘쫑|연근|계란찜|계란장조림|메추리알장조림|어묵전|부침|전$|채$/;
+function mainScore(n){
+  const s=String(n||'').trim();
+  if(!s||BASE.has(s)||slotOf(s)==='기본'||slotOf(s)==='후식'||s==='후식')return -999;
+  let score=0;
+  if(MAIN_FORCE_RE.test(s))score+=12;
+  if(MAIN_SOUP_RE.test(s))score+=18;
+  if(SOUP_RE.test(s))score-=7;
+  if(SIDE_RE.test(s))score-=6;
+  if(slotOf(s)==='국')score-=4;
+  return score;
+}
+function mealMainName(names){
+  const arr=(names||[]).filter(Boolean);
+  const explicit=arr.find(n=>slotOf(n)==='메인');
+  if(explicit)return explicit;
+  let best='',bestScore=-998;
+  arr.forEach(n=>{const sc=mainScore(n)+(slotOf(n)==='메인'?4:0);if(sc>bestScore){best=n;bestScore=sc;}});
+  if(best&&bestScore>0)return best;
+  return arr.find(n=>slotOf(n)!=='국'&&slotOf(n)!=='기본'&&slotOf(n)!=='후식'&&!BASE.has(n))||arr.find(n=>slotOf(n)!=='기본'&&slotOf(n)!=='후식'&&!BASE.has(n))||arr[0]||'';
+}
+function hasExplicitMain(names){return (names||[]).some(n=>slotOf(n)==='메인')}
+function effectiveSlot(n,mainName,fixMissingMain){
+  if(fixMissingMain&&n&&mainName&&n===mainName)return '메인';
+  return slotOf(n);
+}
 function mealOrderNames(names){
+  const fixMissingMain=!hasExplicitMain(names);
+  const main=fixMissingMain?mealMainName(names):'';
   const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
-  (names||[]).forEach(n=>{(by[slotOf(n)]||by.반찬).push(n)});
+  (names||[]).forEach(n=>{(by[effectiveSlot(n,main,fixMissingMain)]||by.반찬).push(n)});
   return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
 }
 function mealOrderItems(items){
+  const names=(items||[]).map(it=>it.n);
+  const fixMissingMain=!hasExplicitMain(names);
+  const main=fixMissingMain?mealMainName(names):'';
   const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
-  (items||[]).forEach(it=>{(by[slotOf(it.n)]||by.반찬).push(it)});
+  (items||[]).forEach(it=>{(by[effectiveSlot(it.n,main,fixMissingMain)]||by.반찬).push(it)});
   return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
 }
 function isBase(n){return BASE.has(n)||slotOf(n)==='기본'}
@@ -773,7 +807,7 @@ function pullMeal(refDate,meal){
 function mealComplete(items,meal){
   if(!items.length)return false;
   if(meal==='조식')return items.length>=2;
-  const hasMain=items.some(x=>slotOf(x.n)==='메인');
+  const hasMain=!!mealMainName(items.map(x=>x.n));
   return hasMain&&items.length>=3;
 }
 /* 끼니별로 '제대로 된' 참조일 찾기 — 부실한(1~2개) 끼니는 건너뛰고 완성된 날을 가져옴 */
@@ -808,7 +842,7 @@ function refDaySet(target,usedMains){
       const d=addDays(base,off);
       if(!BYDAY[d])continue;
       if(dayComplete(d)){
-        const mains=[...pullMeal(d,'점심'),...pullMeal(d,'저녁')].filter(x=>slotOf(x.n)==='메인').map(x=>x.n);
+        const mains=[mealMainName(pullMeal(d,'점심').map(x=>x.n)),mealMainName(pullMeal(d,'저녁').map(x=>x.n))].filter(Boolean);
         const clash=mains.some(n=>usedMains.has(n));
         if(!clash)return d;                       // 안 겹치는 완성된 날 → 바로 채택
         if(!firstComplete)firstComplete=d;        // 겹치지만 완성된 날 기억
@@ -825,20 +859,20 @@ function buildPeriod(start){
   periodDates(start).forEach(d=>{
     if(S.plan[d]){
       // 이미 있는 날의 메인도 누적 집합에 반영(겹침 방지 기준)
-      ['점심','저녁'].forEach(m=>((S.plan[d][m]&&S.plan[d][m].items)||[]).forEach(it=>{if(slotOf(it.n)==='메인')usedMains.add(it.n)}));
+      ['점심','저녁'].forEach(m=>{const mn=mealMainName(((S.plan[d][m]&&S.plan[d][m].items)||[]).map(it=>it.n));if(mn)usedMains.add(mn);});
       return;
     }
     // 그 날짜 자체에 실제 과거 기록이 있으면(예: 직접 넣은 6/15 주) 그걸 그대로 사용
     if(BYDAY[d]&&((BYDAY[d]['점심']||[]).length||(BYDAY[d]['저녁']||[]).length)){
       const lunch0=pullMeal(d,'점심'), dinner0=pullMeal(d,'저녁');
       const bf0=(BYDAY[d]['조식']||[]).length?pullMeal(d,'조식'):BREAKFAST_BASE.map(n=>({n}));
-      [...lunch0,...dinner0].forEach(it=>{if(slotOf(it.n)==='메인')usedMains.add(it.n)});
+      [lunch0,dinner0].forEach(its=>{const mn=mealMainName(its.map(it=>it.n));if(mn)usedMains.add(mn);});
       S.plan[d]={조식:{items:bf0},점심:{items:lunch0},저녁:{items:dinner0}};
       return;
     }
     const ref=refDaySet(d,usedMains);             // 하루 세트 참조일 (기존 메인과 안 겹치게)
     const lunch=ref?pullMeal(ref,'점심'):[], dinner=ref?pullMeal(ref,'저녁'):[];
-    [...lunch,...dinner].forEach(it=>{if(slotOf(it.n)==='메인')usedMains.add(it.n)});
+    [lunch,dinner].forEach(its=>{const mn=mealMainName(its.map(it=>it.n));if(mn)usedMains.add(mn);});
     S.plan[d]={조식:{items:BREAKFAST_BASE.map(n=>({n}))},   // 조식은 기본 3개만, 나머지는 검색해서 채움
                점심:{items:lunch,ref:ref},
                저녁:{items:dinner,ref:ref}};
@@ -914,23 +948,29 @@ function ingDupDays(name,date,meal){
 /* 규칙3: 맛 균형 — 매움(한끼둘/점저동시/이틀연속) + 간장·기름(점저동시) */
 function tasteWarn(date,meal){
   const out=[];
-  const spicyMains=mens(date,meal).filter(n=>slotOf(n)==='메인'&&tasteOf(n)==='매움');
+  const names=mens(date,meal);
+  const main=mealMainName(names);
+  const spicyMains=(main&&tasteOf(main)==='매움')?[main]:[];
   // ① 같은 끼니에 매운 메인이 둘 이상
   if(spicyMains.length>=2) out.push({short:'매운 메인이 한 끼에 둘'});
   // ② 같은 날 점심·저녁 둘 다 매운 메인 (저녁에서 한 번만 알림)
   if(spicyMains.length){
     const other=meal==='점심'?'저녁':'점심';
-    const otherSpicy=mens(date,other).some(n=>slotOf(n)==='메인'&&tasteOf(n)==='매움');
+    const otherMain=mealMainName(mens(date,other));
+    const otherSpicy=otherMain&&tasteOf(otherMain)==='매움';
     if(otherSpicy&&meal==='저녁') out.push({short:'매운 메인이 점심·저녁 둘 다'});
     // ③ 어제 같은 끼니도 매운 메인 (이틀 연속)
-    const yspicy=mens(addDays(date,-1),meal).some(n=>slotOf(n)==='메인'&&tasteOf(n)==='매움');
+    const ymain=mealMainName(mens(addDays(date,-1),meal));
+    const yspicy=ymain&&tasteOf(ymain)==='매움';
     if(yspicy) out.push({short:'매운 메인 이틀 연속'});
   }
   // ④ 간장·기름: 같은 맛 메인이 점심·저녁 모두 (저녁에서 한 번만 알림)
   if(meal==='저녁'){
     ['간장','기름'].forEach(t=>{
-      const lunch=mens(date,'점심').some(n=>slotOf(n)==='메인'&&tasteOf(n)===t);
-      const dinner=mens(date,'저녁').some(n=>slotOf(n)==='메인'&&tasteOf(n)===t);
+      const lunchMain=mealMainName(mens(date,'점심'));
+      const dinnerMain=mealMainName(mens(date,'저녁'));
+      const lunch=lunchMain&&tasteOf(lunchMain)===t;
+      const dinner=dinnerMain&&tasteOf(dinnerMain)===t;
       if(lunch&&dinner) out.push({short:(t==='간장'?'간장':'기름')+' 메인이 점심·저녁 둘 다'});
     });
   }
@@ -1023,7 +1063,10 @@ function cellHtml(date,meal,badset){
   if(!items.length)return '<div class="cell empty'+(canDrop?' drop':'')+'" data-date="'+date+'" data-meal="'+meal+'" onclick="cellClick(\''+date+'\',\''+meal+'\')">'+(canDrop?'여기로 바꾸기':'작년 자료 없음<br><span style="font-size:11px">눌러서 직접 채우기</span>')+'</div>';
   let h='<div class="cell'+(isBad?' bad':'')+(sel?' sel':'')+(moving?' moving':'')+(canDrop?' drop':'')+'" data-date="'+date+'" data-meal="'+meal+'" draggable="true" onclick="cellClick(\''+date+'\',\''+meal+'\')">';
   h+='<button class="swaph" title="자리 바꾸기" onclick="event.stopPropagation();pickSwap(\''+date+'\',\''+meal+'\')">⇄</button>';
-  mealOrderItems(items).forEach(it=>{const b=badset.has(it.n),sl=slotOf(it.n),cls=sl==='메인'?'mn':'it';
+  const names=items.map(it=>it.n);
+  const fixMissingMain=!hasExplicitMain(names);
+  const main=fixMissingMain?mealMainName(names):'';
+  mealOrderItems(items).forEach(it=>{const b=badset.has(it.n),sl=effectiveSlot(it.n,main,fixMissingMain),cls=sl==='메인'?'mn':'it';
     h+='<div class="'+cls+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
   return h+'</div>';
 }
@@ -1202,11 +1245,10 @@ function drawSheet(){
   const {date,meal}=cur;
   const rawItems=(S.plan[date][meal].items)||[];
   // 식단표 칸과 같은 순서로: 메인→국→반찬→기본→후식
-  const SORD={메인:0,국:1,부찬:2,반찬:2,기본:3,후식:4};
-  const items=rawItems.map((it,i)=>({it,i})).sort((a,b)=>{
-    const sa=SORD[slotOf(a.it.n)]??2, sb=SORD[slotOf(b.it.n)]??2;
-    return sa!==sb?sa-sb:a.i-b.i;
-  }).map(x=>x.it);
+  const rawNames=rawItems.map(it=>it.n);
+  const fixMissingMain=!hasExplicitMain(rawNames);
+  const main=fixMissingMain?mealMainName(rawNames):'';
+  const items=mealOrderItems(rawItems);
   const warns=mealWarnings(date,meal);
   const badset=new Set(warns.map(w=>w.n));
   let h='';
@@ -1248,7 +1290,7 @@ function drawSheet(){
   if(!items.length)h+='<div class="empty-note">비어 있어요. 아래에서 골라 담으세요.</div>';
   items.forEach((it)=>{
     const i=rawItems.indexOf(it);
-    const sl=slotOf(it.n);const b=badset.has(it.n);const a=algOf(it.n);
+    const sl=effectiveSlot(it.n,main,fixMissingMain);const b=badset.has(it.n);const a=algOf(it.n);
     const opened=replaceIdx===i;
     h+='<div class="crow'+(sl==='메인'?' main':'')+(b?' badrow':'')+'">'
       +'<span class="cslot">'+sl+'</span>'
@@ -1263,11 +1305,11 @@ function drawSheet(){
       h+='<div class="algedit">';
       h+='<div class="alglab">구분</div><div class="algrow">';
       ['메인','국','반찬','후식','기본'].forEach(s=>{
-        const real=normSlot(s);const on=slotOf(it.n)===real;
+        const real=normSlot(s);const on=effectiveSlot(it.n,main,fixMissingMain)===real;
         h+='<button class="algchip'+(on?' on':'')+'" onclick="setItemSlot('+i+',\''+s+'\')">'+s+'</button>';
       });
       h+='</div>';
-      const _tsl=slotOf(it.n);
+      const _tsl=effectiveSlot(it.n,main,fixMissingMain);
       if(_tsl==='메인'||_tsl==='국'||_tsl==='반찬'){
         const _ct=tasteOf(it.n);
         h+='<div class="alglab">맛 <span class="alglab-sub">· 하나만</span></div><div class="algrow">';
@@ -1315,7 +1357,8 @@ function drawSheet(){
   let quick='';let seen={};
   const usedRef=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].ref)||null;
   const curItems=((S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[]);
-  const curMains=new Set(curItems.filter(x=>slotOf(x.n)==='메인').map(x=>x.n));
+  const curMain=mealMainName(curItems.map(x=>x.n));
+  const curMains=new Set(curMain?[curMain]:[]);
   const curNames=new Set(curItems.map(x=>x.n));
   const cands=[];
   for(const back of [364,728,1092]){
@@ -1331,7 +1374,7 @@ function drawSheet(){
     const dd=addDays(date,off);
     if(dd===date)continue;
     ['점심','저녁'].forEach(mm=>{
-      mens(dd,mm).forEach(n=>{if(slotOf(n)==='메인')nearMains.add(n)});
+      const mn=mealMainName(mens(dd,mm));if(mn)nearMains.add(mn);
     });
   }
   cands.forEach(rd=>{
@@ -1339,7 +1382,8 @@ function drawSheet(){
     if(usedRef&&rd===usedRef)return;                 // 이미 이 칸에 쓴 출처 제외
     const its=pullMeal(rd,meal);
     if(!mealComplete(its,meal))return;               // 부실한(빈칸 같은) 끼니 제외
-    const mains=its.filter(x=>slotOf(x.n)==='메인').map(x=>x.n);
+    const mmain=mealMainName(its.map(x=>x.n));
+    const mains=mmain?[mmain]:[];
     if(mains.some(n=>curMains.has(n)))return;         // 지금 메인과 같은 메인 제외
     if(mains.some(n=>nearMains.has(n)))return;        // 최근 2주·이번 2주에 쓴 메인이면 제외(도돌이표 방지)
     const overlap=its.filter(x=>curNames.has(x.n)).length;
@@ -1497,12 +1541,11 @@ function doReplace(i,name,isNew){
 /* 대표메뉴로 과거 끼니 통째 찾기 — 최근·안 겹치는 순 5개 */
 function altLines(its){
   // its: [{n}] 또는 [name] — 자리순 정렬, 메인 굵게, 한 줄씩
-  const order={메인:0,국:1,반찬:2,기본:3,후식:4};
-  const arr=its.map(x=>typeof x==='string'?x:x.n);
-  arr.sort((a,b)=>(order[slotOf(a)]??2)-(order[slotOf(b)]??2));
+  const arr=mealOrderNames(its.map(x=>typeof x==='string'?x:x.n));
+  const main=mealMainName(arr);
   return '<div class="altls">'+arr.map(n=>{
-    const main=slotOf(n)==='메인';
-    return '<div class="altl'+(main?' m':'')+'">'+esc(n)+'</div>';
+    const isMain=n===main;
+    return '<div class="altl'+(isMain?' m':'')+'">'+esc(n)+'</div>';
   }).join('')+'</div>';
 }
 /* 지금 이 끼니 구성을 저장 — 나중에 통째 바꾸기 검색에 뜸 */
@@ -1534,11 +1577,13 @@ function drawMealFind(){
   hits.sort((a,b)=>a.date<b.date?1:-1);
   hits=prioritizeSearchList(hits,q,rec=>rec.items||[]);
   // 현재 끼니의 메인 (겹침 제외용)
-  const curMains=new Set(cur?((S.plan[cur.date]&&S.plan[cur.date][cur.meal]&&S.plan[cur.date][cur.meal].items)||[]).filter(x=>slotOf(x.n)==='메인').map(x=>x.n):[]);
+  const curItemsForMain=cur?((S.plan[cur.date]&&S.plan[cur.date][cur.meal]&&S.plan[cur.date][cur.meal].items)||[]):[];
+  const curMainForFind=mealMainName(curItemsForMain.map(x=>x.n));
+  const curMains=new Set(curMainForFind?[curMainForFind]:[]);
   // 최근 2주 + 이번 2주에 쓴 메인 → 도돌이표 방지로 제외
   const nearMains=new Set();
   if(cur){for(let off=-14;off<=13;off++){const dd=addDays(cur.date,off);if(dd===cur.date)continue;
-    ['점심','저녁'].forEach(mm=>mens(dd,mm).forEach(n=>{if(slotOf(n)==='메인')nearMains.add(n)}));}}
+    ['점심','저녁'].forEach(mm=>{const mn=mealMainName(mens(dd,mm));if(mn)nearMains.add(mn);});}}
   // 같은 구성(메인 조합)이 반복되면 하나만, 부실/겹침 제외 — 단 저장한 구성은 면제
   const out=[];
   // 저장한 구성 먼저
@@ -1550,7 +1595,8 @@ function drawMealFind(){
     if(String(rec.date).startsWith('saved'))continue;   // 위에서 이미 넣음
     const its=rec.items.map(n=>({n}));
     if(!mealComplete(its,rec.meal))continue;            // 부실한 끼니 제외
-    const mains=rec.items.filter(n=>slotOf(n)==='메인');
+    const recMain=mealMainName(rec.items);
+    const mains=recMain?[recMain]:[];
     if(mains.some(n=>curMains.has(n)))continue;          // 현재 메인과 겹치면 제외
     if(mains.some(n=>nearMains.has(n)))continue;         // 최근/이번 2주에 쓴 메인 제외
     const key=mains.slice().sort().join('|');
@@ -2394,11 +2440,7 @@ function ordFb(t){var ta=document.createElement('textarea');ta.value=t;document.
 function ordOpenModal(date,meal){ordModal={date:date,meal:meal};ordRenderModal();document.getElementById('oov').classList.add('on');}
 function ordCloseModal(){ordTrim();document.getElementById('oov').classList.remove('on');ordModal=null;ordSave();ordApplyPendingRemote();if(typeof applyPendingRemoteState==='function')applyPendingRemoteState();ordRenderBoard();}
 function ordSortItems(raw){
-  var SO={'메인':0,'국':1,'반찬':2,'기본':3,'후식':4};
-  return raw.map(function(it,idx){return {it:it,idx:idx};}).sort(function(a,b){
-    var d=(SO[slotOf(a.it.n)]==null?9:SO[slotOf(a.it.n)])-(SO[slotOf(b.it.n)]==null?9:SO[slotOf(b.it.n)]);
-    return d!==0?d:a.idx-b.idx;
-  }).map(function(x){return x.it;});
+  return mealOrderItems(raw||[]);
 }
 function ordItems(){return ordSortItems((ordModal&&S.plan[ordModal.date]&&S.plan[ordModal.date][ordModal.meal]&&S.plan[ordModal.date][ordModal.meal].items)||[]);}
 function ordIsBlank(r){return !r.stock && !(r.ing&&String(r.ing).trim()) && !(r.q&&String(r.q).trim());}
