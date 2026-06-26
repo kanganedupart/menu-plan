@@ -358,14 +358,26 @@ const CORE_MENU_FIX={
   '요구르트':{slot:'후식',alg:'',ing:'기타',taste:'담백',tier:'B'}
 };
 const FORCE_MAIN_SLOT_RE=/제육|닭도리탕|닭볶음탕|찜닭|돈까스|돈가스|함박|갈비찜/;
+const FORCE_BASIC_SLOT_RE=/^(흰밥|쌀밥|잡곡밥|현미밥|김치|깍두기|단무지|피클|김|사조김|후리가케|흰밥·후리가케|오복지|쌈무)$/;
+const FORCE_SOUP_SLOT_RE=/(국|탕|찌개|전골|스프|수프|육수)$/;
+const FORCE_SIDE_SLOT_RE=/(미역줄기|콩나물무침|숙주무침|숙주나물|시금치무침|무침|나물|생채|샐러드|진미채|우엉채|감자채|연근조림|감자조림|멸치볶음|콩자반|무말랭이|파절이|양파절임|양파채|깻잎지|장아찌|마늘쫑|그린빈|새송이|계란찜|달걀찜|연두부|마카로니)/;
+function fixedSlotFromName(name){
+  if(FORCE_BASIC_SLOT_RE.test(name))return '기본';
+  if(FORCE_MAIN_SLOT_RE.test(name))return '메인';
+  if(FORCE_SOUP_SLOT_RE.test(name))return '국';
+  if(FORCE_SIDE_SLOT_RE.test(name))return '반찬';
+  return '';
+}
+function userSlotOfName(name){
+  try{const f=S&&S.fix&&S.fix[name];return f&&f.slotUser&&f.slot?f.slot:''}catch(e){return ''}
+}
 function ensureMenu(name, slot, alg){
   if(!name||MENU[name])return;
   MENU[name]={name,slot:slot||'반찬',alg:alg||'',cnt:0,ing:'기타',taste:inferMissingTaste(name),tier:'B',flag:false};
 }
 function inferMissingSlot(name){
-  if(/^(흰밥|쌀밥|잡곡밥|현미밥|김치|깍두기|단무지|피클)$/.test(name))return '기본';
-  if(FORCE_MAIN_SLOT_RE.test(name))return '메인';
-  if(/(국|탕|찌개|스프|육수)$/.test(name))return '국';
+  const fixed=fixedSlotFromName(name);
+  if(fixed)return fixed;
   if(/(후식|요구르트|요플레|음료|주스|과일|황도|귤|바나나|몽쉘|쿠키|카스타드)/.test(name))return '후식';
   return '반찬';
 }
@@ -381,9 +393,12 @@ function enforceCoreMenus(){
     try{if(S&&S.fix)S.fix[name]=Object.assign(S.fix[name]||{},CORE_MENU_FIX[name]);}catch(e){}
   });
   Object.keys(MENU).forEach(name=>{
-    if(FORCE_MAIN_SLOT_RE.test(name)){
-      MENU[name].slot='메인';
-      try{if(S&&S.fix)S.fix[name]=Object.assign(S.fix[name]||{},{slot:'메인'});}catch(e){}
+    if(CORE_MENU_FIX[name])return;
+    const manual=userSlotOfName(name);
+    if(manual){MENU[name].slot=manual;return}
+    const slot=fixedSlotFromName(name);
+    if(slot){
+      MENU[name].slot=slot;
     }
   });
 }
@@ -418,7 +433,7 @@ const LS='bareun_v11';
 const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 각 기기에서만 기억
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260626_1810_save_guard'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260626_1855_fixed_slot_dictionary'; // 배포 캐시/구버전 확인용
 // Firebase 설정 여부
 const FB_ON = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.databaseURL);
 let fbRef=null, fbReady=false, fbApplying=false;
@@ -804,14 +819,27 @@ const RULE={menuWeeks:2, ingDays:3};   // 메뉴 중복 2주, 재료 중복 3일
 const ING_DUP_SKIP=new Set(['돼지','소','닭','오리','야채','기타']);   // 고기·야채·미분류는 재료중복에서 제외
 const BREAKFAST_BASE=['시리얼','우유','김치'];   // 조식 기본(자동) — 삭제만 가능, 나머지는 검색해서 채움
 const BASE=new Set(['흰밥','김치','깍두기','단무지','쌈장','초간장','피클','김','쌈무','열무김치','후리가케','사조김','흑미밥','흰밥·후리가케','양파절임','오복지','깻잎지','무말랭이','파절이']);
-function slotOf(n){const m=MENU[n];return m?m.slot:'메인'}
+function slotOf(n){
+  const s=String(n||'').trim();
+  if(!s)return '반찬';
+  if(CORE_MENU_FIX[s])return CORE_MENU_FIX[s].slot;
+  const manual=userSlotOfName(s);
+  if(manual)return manual;
+  if(BASE.has(s)||FORCE_BASIC_SLOT_RE.test(s))return '기본';
+  if(s==='후식')return '후식';
+  const fixed=fixedSlotFromName(s);
+  if(fixed)return fixed;
+  const m=MENU[s];
+  return m?m.slot:inferMissingSlot(s);
+}
+function isBaseMenu(n){const s=String(n||'').trim();return BASE.has(s)||slotOf(s)==='기본'||slotOf(s)==='후식'||s==='후식'}
 const MAIN_FORCE_RE=/제육|닭도리|닭볶음|닭갈비|불고기|돈까스|돈가스|까스|탕수|강정|튀김|구이|볶음|조림|찜|스테이크|함박|갈비|수육|보쌈|오리|두루치기|돈육장조림|모듬장조림|소고기장조림|쇠고기장조림|떡갈비|치킨|너겟|유린기|카레|짜장|하이라이스|덮밥|볶음밥|마파두부|깐풍|라조기|폭찹|동그랑땡|잡채/;
 const MAIN_SOUP_RE=/닭도리탕|닭볶음탕|감자탕|갈비탕|설렁탕|육개장|해장국|국밥|추어탕|삼계탕/;
 const SOUP_RE=/국|탕|찌개|스프|수프|미소|된장|미역/;
 const SIDE_RE=/무침|나물|샐러드|김치|깍두기|피클|단무지|장아찌|쌈|콩자반|멸치|진미채|오복지|마늘쫑|연근|계란찜|계란장조림|메추리알장조림|어묵전|부침|전$|채$/;
 function mainScore(n){
   const s=String(n||'').trim();
-  if(!s||BASE.has(s)||slotOf(s)==='기본'||slotOf(s)==='후식'||s==='후식')return -999;
+  if(!s||isBaseMenu(s))return -999;
   let score=0;
   if(MAIN_FORCE_RE.test(s))score+=12;
   if(MAIN_SOUP_RE.test(s))score+=18;
@@ -822,31 +850,20 @@ function mainScore(n){
 }
 function mealMainName(names){
   const arr=(names||[]).filter(Boolean);
-  const explicit=arr.find(n=>slotOf(n)==='메인');
-  if(explicit)return explicit;
-  let best='',bestScore=-998;
-  arr.forEach(n=>{const sc=mainScore(n)+(slotOf(n)==='메인'?4:0);if(sc>bestScore){best=n;bestScore=sc;}});
-  if(best&&bestScore>0)return best;
-  return arr.find(n=>slotOf(n)!=='국'&&slotOf(n)!=='기본'&&slotOf(n)!=='후식'&&!BASE.has(n))||arr.find(n=>slotOf(n)!=='기본'&&slotOf(n)!=='후식'&&!BASE.has(n))||arr[0]||'';
+  return arr.find(n=>slotOf(n)==='메인'&&!isBaseMenu(n))||'';
 }
-function hasExplicitMain(names){return (names||[]).some(n=>slotOf(n)==='메인')}
+function hasExplicitMain(names){return (names||[]).some(n=>slotOf(n)==='메인'&&!isBaseMenu(n))}
 function effectiveSlot(n,mainName,fixMissingMain){
-  if(fixMissingMain&&n&&mainName&&n===mainName)return '메인';
   return slotOf(n);
 }
 function mealOrderNames(names){
-  const fixMissingMain=!hasExplicitMain(names);
-  const main=fixMissingMain?mealMainName(names):'';
   const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
-  (names||[]).forEach(n=>{(by[effectiveSlot(n,main,fixMissingMain)]||by.반찬).push(n)});
+  (names||[]).forEach(n=>{(by[slotOf(n)]||by.반찬).push(n)});
   return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
 }
 function mealOrderItems(items){
-  const names=(items||[]).map(it=>it.n);
-  const fixMissingMain=!hasExplicitMain(names);
-  const main=fixMissingMain?mealMainName(names):'';
   const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
-  (items||[]).forEach(it=>{(by[effectiveSlot(it.n,main,fixMissingMain)]||by.반찬).push(it)});
+  (items||[]).forEach(it=>{(by[slotOf(it.n)]||by.반찬).push(it)});
   return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
 }
 function isBase(n){return BASE.has(n)||slotOf(n)==='기본'}
@@ -1809,7 +1826,7 @@ function setItemSlot(i,label){
   const real=normSlot(label);
   if(!MENU[it.n])MENU[it.n]={name:it.n,slot:real,alg:'',cnt:0,ing:'기타',taste:'담백',tier:'B',flag:false};
   else MENU[it.n].slot=real;
-  S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{slot:real});
+  S.fix=S.fix||{};S.fix[it.n]=Object.assign(S.fix[it.n]||{},{slot:real,slotUser:1});
   save();drawSheet();markDirty();
 }
 function setItemTaste(i,taste){
@@ -2102,6 +2119,7 @@ function renderQuiz(){
 }
 function quizAns(name,field,val){
   const f=S.fix[name]=S.fix[name]||{};f[field]=val;
+  if(field==='slot')f.slotUser=1;
   if(MENU[name])MENU[name][field]=val;
   if(field==='slot'){quizStep=(val==='메인'||val==='반찬')?'ing':'taste';
     if(val==='국'||val==='후식'){ // 국·후식은 재료/맛 덜 중요 — 바로 종료
