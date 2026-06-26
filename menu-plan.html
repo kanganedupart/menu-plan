@@ -699,6 +699,16 @@ const ING_DUP_SKIP=new Set(['돼지','소','닭','오리','야채','기타']);  
 const BREAKFAST_BASE=['시리얼','우유','김치'];   // 조식 기본(자동) — 삭제만 가능, 나머지는 검색해서 채움
 const BASE=new Set(['흰밥','김치','깍두기','단무지','쌈장','초간장','피클','김','쌈무','열무김치','후리가케','사조김','흑미밥','흰밥·후리가케','양파절임','오복지','깻잎지','무말랭이','파절이']);
 function slotOf(n){const m=MENU[n];return m?m.slot:'메인'}
+function mealOrderNames(names){
+  const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
+  (names||[]).forEach(n=>{(by[slotOf(n)]||by.반찬).push(n)});
+  return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
+}
+function mealOrderItems(items){
+  const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
+  (items||[]).forEach(it=>{(by[slotOf(it.n)]||by.반찬).push(it)});
+  return [].concat(by.메인,by.국,by.반찬,by.기본,by.후식);
+}
 function isBase(n){return BASE.has(n)||slotOf(n)==='기본'}
 const GENERIC=new Set(['후식','음료','주스','과일','식단표','공란']);
 function isGeneric(n){return GENERIC.has(n)}
@@ -1011,17 +1021,10 @@ function cellHtml(date,meal,badset){
   const moving=swapFrom&&swapFrom.date===date&&swapFrom.meal===meal;
   const canDrop=swapFrom&&swapFrom.meal===meal&&!moving;
   if(!items.length)return '<div class="cell empty'+(canDrop?' drop':'')+'" data-date="'+date+'" data-meal="'+meal+'" onclick="cellClick(\''+date+'\',\''+meal+'\')">'+(canDrop?'여기로 바꾸기':'작년 자료 없음<br><span style="font-size:11px">눌러서 직접 채우기</span>')+'</div>';
-  const by={메인:[],국:[],반찬:[],기본:[],후식:[]};
-  items.forEach(it=>{(by[slotOf(it.n)]||by.반찬).push(it)});
   let h='<div class="cell'+(isBad?' bad':'')+(sel?' sel':'')+(moving?' moving':'')+(canDrop?' drop':'')+'" data-date="'+date+'" data-meal="'+meal+'" draggable="true" onclick="cellClick(\''+date+'\',\''+meal+'\')">';
   h+='<button class="swaph" title="자리 바꾸기" onclick="event.stopPropagation();pickSwap(\''+date+'\',\''+meal+'\')">⇄</button>';
-  by.메인.forEach(it=>{const b=badset.has(it.n);
-    h+='<div class="mn'+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
-  by.국.forEach(it=>{const b=badset.has(it.n);h+='<div class="it'+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
-  by.반찬.forEach(it=>{const b=badset.has(it.n);
-    h+='<div class="it'+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
-  by.기본.forEach(it=>{h+='<div class="it">'+esc(it.n)+'</div>'});
-  by.후식.forEach(it=>{h+='<div class="it">'+esc(it.n)+'</div>'});
+  mealOrderItems(items).forEach(it=>{const b=badset.has(it.n),sl=slotOf(it.n),cls=sl==='메인'?'mn':'it';
+    h+='<div class="'+cls+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
   return h+'</div>';
 }
 function tasteBadge(n){const sl=slotOf(n);if(sl!=='메인'&&sl!=='국'&&sl!=='반찬')return '';const t=tasteOf(n);if(!t)return '';return '<span class="tbadge t'+t+'">'+t+'</span>';}
@@ -1838,7 +1841,7 @@ function confirmWeek(ws){
   const data={};
   [...wd,sun].forEach(d=>{data[d]={};['조식','점심','저녁'].forEach(meal=>{
     const its=((S.plan[d]&&S.plan[d][meal]&&S.plan[d][meal].items)||[]);
-    if(its.length)data[d][meal]=its.map(it=>it.n);
+    if(its.length)data[d][meal]=mealOrderItems(its).map(it=>it.n);
   })});
   const existed=!!S.confirmed[ws];
   S.confirmed[ws]={start:ws,dates:wd,sun,data,at:Date.now()};
@@ -1869,7 +1872,7 @@ function downloadConfirmed(){
       const any=cols.some(d=>(c.data[d]&&c.data[d][meal]&&c.data[d][meal].length));
       if(meal!=='조식'||any){
         aoa.push([meal, ...cols.map(d=>{
-          const its=(c.data[d]&&c.data[d][meal])||[];
+          const its=mealOrderNames((c.data[d]&&c.data[d][meal])||[]);
           return its.map(n=>n+(algOf(n)?' '+algOf(n):'')).join('\n');
         })]);
       }
