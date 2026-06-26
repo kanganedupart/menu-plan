@@ -419,12 +419,85 @@ function normalizeState(){
   S._ts=S._ts||{plan:{},confirmed:{},fix:{},cleared:{},saved:0,skip:0};
   S._ts.plan=S._ts.plan||{};S._ts.confirmed=S._ts.confirmed||{};S._ts.fix=S._ts.fix||{};S._ts.cleared=S._ts.cleared||{};S._ts.saved=S._ts.saved||0;S._ts.skip=S._ts.skip||0;
 }
+function stateEnsureShape(st){
+  st=st||{};
+  st.plan=st.plan||{};st.confirmed=st.confirmed||{};st.skip=st.skip||[];st.saved=st.saved||[];st.cleared=st.cleared||{};st.fix=st.fix||{};
+  st._ts=st._ts||{plan:{},confirmed:{},fix:{},cleared:{},saved:0,skip:0};
+  st._ts.plan=st._ts.plan||{};st._ts.confirmed=st._ts.confirmed||{};st._ts.fix=st._ts.fix||{};st._ts.cleared=st._ts.cleared||{};st._ts.saved=st._ts.saved||0;st._ts.skip=st._ts.skip||0;
+  return st;
+}
+function stateRepairMissingTs(st,baseAt){
+  if(!st)return false;stateEnsureShape(st);
+  const at=+baseAt||+st.updatedAt||Date.now();let changed=false;
+  Object.keys(statePlanKeys(st.plan)).forEach(k=>{if(!(+st._ts.plan[k])){st._ts.plan[k]=at;changed=true;}});
+  ['confirmed','fix','cleared'].forEach(kind=>{
+    const map=st[kind]||{},ts=st._ts[kind]||{};
+    Object.keys(map).forEach(k=>{if(!(+ts[k])){ts[k]=+((map[k]||{}).at)||at;changed=true;}});
+    st._ts[kind]=ts;
+  });
+  if(Array.isArray(st.saved)&&st.saved.length&&!+st._ts.saved){st._ts.saved=at;changed=true;}
+  if(Array.isArray(st.skip)&&st.skip.length&&!+st._ts.skip){st._ts.skip=at;changed=true;}
+  return changed;
+}
 function readViewStart(){try{return localStorage.getItem(VIEW_LS)||''}catch(e){return ''}}
 function rememberViewStart(v){S.start=v;try{localStorage.setItem(VIEW_LS,v)}catch(e){}}
 function sharedState(){
   const out=JSON.parse(JSON.stringify(S));
-  delete out.start;             // 날짜 보기 위치는 Firebase에 올리지 않는다
+  stateRepairMissingTs(out,Date.now());
+  delete out.start;
   return out;
+}
+function stateMaxTs(st){
+  st=st||{};const ts=st._ts||{};let mx=+st.updatedAt||0;
+  Object.keys(ts.plan||{}).forEach(k=>{mx=Math.max(mx,+ts.plan[k]||0)});
+  ['confirmed','fix','cleared'].forEach(kind=>Object.keys(ts[kind]||{}).forEach(k=>{mx=Math.max(mx,+ts[kind][k]||0)}));
+  mx=Math.max(mx,+ts.saved||0,+ts.skip||0);
+  return mx||Date.now();
+}
+function stateSetPlanCell(plan,k,cell){
+  const [d,m]=k.split('|');
+  plan[d]=plan[d]||{};
+  if(cell===undefined)delete plan[d][m]; else plan[d][m]=stateClone(cell);
+  if(plan[d]&&!Object.keys(plan[d]).length)delete plan[d];
+}
+function mergeLocalIntoRemote(remote,local){
+  remote=remote||{};local=local||{};
+  stateEnsureShape(remote);stateEnsureShape(local);
+  stateRepairMissingTs(remote,+remote.updatedAt||Date.now());
+  stateRepairMissingTs(local,+local.updatedAt||Date.now());
+  const out=stateClone(remote);
+  stateEnsureShape(out);
+  out.plan=out.plan||{};out.confirmed=out.confirmed||{};out.fix=out.fix||{};out.cleared=out.cleared||{};
+  const rts=out._ts||{},lts=local._ts||{};
+  const pkeys={};Object.keys(lts.plan||{}).forEach(k=>pkeys[k]=1);Object.keys(statePlanKeys(local.plan)).forEach(k=>pkeys[k]=1);
+  Object.keys(pkeys).forEach(k=>{
+    const lt=+lts.plan[k]||0,rt=+(rts.plan||{})[k]||0;
+    if(lt>rt){stateSetPlanCell(out.plan,k,remoteCell(local.plan,k));out._ts.plan[k]=lt;}
+  });
+  ['confirmed','fix','cleared'].forEach(kind=>{
+    const keys={};Object.keys((local._ts&&local._ts[kind])||{}).forEach(k=>keys[k]=1);Object.keys(local[kind]||{}).forEach(k=>keys[k]=1);
+    Object.keys(keys).forEach(k=>{
+      const lt=+(lts[kind]||{})[k]||0,rt=+(rts[kind]||{})[k]||0;
+      if(lt>rt){
+        if(Object.prototype.hasOwnProperty.call(local[kind]||{},k))out[kind][k]=stateClone(local[kind][k]); else delete out[kind][k];
+        out._ts[kind][k]=lt;
+      }
+    });
+  });
+  if((+lts.saved||0)>((+rts.saved)||0)){out.saved=stateClone(local.saved||[]);out._ts.saved=+lts.saved||Date.now();}
+  if((+lts.skip||0)>((+rts.skip)||0)){out.skip=stateClone(local.skip||[]);out._ts.skip=+lts.skip||Date.now();}
+  out.planLogicVer=PLAN_LOGIC_VER;
+  out.updatedAt=Math.max(stateMaxTs(out),stateMaxTs(local),stateMaxTs(remote));
+  delete out.start;
+  return out;
+}
+function writeSharedState(){
+  if(!fbRef)return;
+  const local=sharedState();
+  if(fbRef.transaction){
+    return fbRef.transaction(current=>mergeLocalIntoRemote(current||{},local),()=>{},false);
+  }
+  return fbRef.set(local);
 }
 function backupState(reason,state){
   try{
@@ -477,39 +550,44 @@ function remoteCell(remotePlan,k){
   const [d,m]=k.split('|');
   return remotePlan&&remotePlan[d]&&Object.prototype.hasOwnProperty.call(remotePlan[d],m)?stateClone(remotePlan[d][m]):undefined;
 }
-function mergeRemoteMap(kind,target,remoteMap,remoteTs){
+function mergeRemoteMap(kind,target,remoteMap,remoteTs,forceRemoteExisting){
   remoteMap=remoteMap||{};remoteTs=remoteTs||{};const keys={};Object.keys(remoteMap).forEach(k=>keys[k]=1);Object.keys(remoteTs).forEach(k=>keys[k]=1);Object.keys(S._ts[kind]||{}).forEach(k=>keys[k]=1);
   Object.keys(keys).forEach(k=>{
     const rt=+remoteTs[k]||0,lt=+S._ts[kind][k]||0;
-    if(rt>lt){if(Object.prototype.hasOwnProperty.call(remoteMap,k))target[k]=stateClone(remoteMap[k]);else delete target[k];S._ts[kind][k]=rt;}
+    const hasRemote=Object.prototype.hasOwnProperty.call(remoteMap,k);
+    if(rt>lt||(forceRemoteExisting&&hasRemote)){if(hasRemote)target[k]=stateClone(remoteMap[k]);else delete target[k];S._ts[kind][k]=rt||Date.now();}
   });
 }
-function mergeRemoteState(remote,keepStart){
+function mergeRemoteState(remote,keepStart,opts){
   if(!remote||!remote._ts){applyRemoteState(remote,keepStart);return;}
   backupState('before-remote-merge',S);
+  opts=opts||{};
+  stateRepairMissingTs(remote,+remote.updatedAt||Date.now());
   normalizeState();remote.plan=remote.plan||{};remote.confirmed=remote.confirmed||{};remote.fix=remote.fix||{};remote.cleared=remote.cleared||{};
   const rts=remote._ts||{},planTs=rts.plan||{},planKeys={};Object.keys(planTs).forEach(k=>planKeys[k]=1);Object.keys(statePlanKeys(remote.plan)).forEach(k=>planKeys[k]=1);Object.keys(S._ts.plan||{}).forEach(k=>planKeys[k]=1);
   Object.keys(planKeys).forEach(k=>{
     const rt=+planTs[k]||0,lt=+S._ts.plan[k]||0;
-    if(rt>lt){
+    const cell=remoteCell(remote.plan,k);
+    if(rt>lt||(opts.forceRemoteExisting&&cell!==undefined)){
       const [d,m]=k.split('|'),cell=remoteCell(remote.plan,k);
       S.plan[d]=S.plan[d]||{};
       if(cell===undefined)delete S.plan[d][m]; else S.plan[d][m]=cell;
       if(S.plan[d]&&!Object.keys(S.plan[d]).length)delete S.plan[d];
-      S._ts.plan[k]=rt;
+      S._ts.plan[k]=rt||Date.now();
     }
   });
-  mergeRemoteMap('confirmed',S.confirmed,remote.confirmed,rts.confirmed);
-  mergeRemoteMap('fix',S.fix,remote.fix,rts.fix);
-  mergeRemoteMap('cleared',S.cleared,remote.cleared,rts.cleared);
+  mergeRemoteMap('confirmed',S.confirmed,remote.confirmed,rts.confirmed,opts.forceRemoteExisting);
+  mergeRemoteMap('fix',S.fix,remote.fix,rts.fix,opts.forceRemoteExisting);
+  mergeRemoteMap('cleared',S.cleared,remote.cleared,rts.cleared,opts.forceRemoteExisting);
   if((+rts.saved||0)>(+S._ts.saved||0)){S.saved=stateClone(remote.saved||[]);S._ts.saved=+rts.saved||Date.now();}
   if((+rts.skip||0)>(+S._ts.skip||0)){S.skip=stateClone(remote.skip||[]);S._ts.skip=+rts.skip||Date.now();}
-  S.updatedAt=Math.max(S.updatedAt||0,remote.updatedAt||0);S.planLogicVer=PLAN_LOGIC_VER;S.start=keepStart||readViewStart()||null;
+  S.updatedAt=opts.forceRemoteExisting?(+remote.updatedAt||S.updatedAt||0):Math.max(S.updatedAt||0,remote.updatedAt||0);S.planLogicVer=PLAN_LOGIC_VER;S.start=keepStart||readViewStart()||null;
   applyFixesToMenu();try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){};STATE_LAST=stateSnapshot();
 }
 function applyRemoteState(remote,keepStart){
   backupState('before-remote-apply',S);
   S=remote||{};
+  stateRepairMissingTs(S,+S.updatedAt||Date.now());
   normalizeState();
   S.planLogicVer=PLAN_LOGIC_VER;
   S.start=keepStart||readViewStart()||null;
@@ -518,9 +596,11 @@ function applyRemoteState(remote,keepStart){
 }
 function menuEditing(){
   const _sh=document.getElementById('sheet'), _oov=document.getElementById('oov');
-  return (_sh&&_sh.classList.contains('on'))
-    || (_oov&&_oov.classList.contains('on'))
-    || (document.activeElement && /TEXTAREA|INPUT/.test(document.activeElement.tagName));
+  const sheetOpen=!!(_sh&&_sh.classList.contains('on'));
+  const orderOpen=!!(_oov&&_oov.classList.contains('on'));
+  const ae=document.activeElement;
+  const activeInput=!!(ae&&/TEXTAREA|INPUT/.test(ae.tagName)&&ae.offsetParent!==null);
+  return sheetOpen||orderOpen||activeInput;
 }
 function applyPendingRemoteState(){
   if(!pendingRemoteState||menuEditing())return;
@@ -545,6 +625,7 @@ let lastLocalSave=0;
 const save=()=>{
   backupStoredState('before-save');
   stateStampDiff();
+  stateRepairMissingTs(S,Date.now());
   lastLocalSave=Date.now();
   S.planLogicVer=PLAN_LOGIC_VER;
   S.updatedAt=Date.now();          // 저장 시각 — 충돌 시 더 최근 것이 이긴다
@@ -552,7 +633,7 @@ const save=()=>{
   // Firebase에도 저장 (잠깐 모아서 한 번에 — 너무 자주 쓰지 않게)
   if(FB_ON && fbReady && fbRef && !fbApplying){
     clearTimeout(saveTimer);
-    saveTimer=setTimeout(()=>{ try{ fbRef.set(sharedState()) }catch(e){} }, 400);
+    saveTimer=setTimeout(()=>{ try{ writeSharedState() }catch(e){} }, 400);
   }
 };
 /* Firebase 시작 — 키가 있을 때만. 최신 데이터를 받아와 화면 갱신, 이후 실시간 동기화 */
@@ -563,26 +644,29 @@ function initFirebase(){
     fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
     fbRef.once('value').then(snap=>{
       const remote=snap.val();
+      const remoteRepaired = remote ? stateRepairMissingTs(remote,+remote.updatedAt||Date.now()) : false;
       const remoteHasPlan = remote && remote.plan && Object.keys(remote.plan).length;
       const localHasPlan = S.plan && Object.keys(S.plan).length;
       const keepStart=S.start;
       // 공유 모드에서는 Firebase를 기준으로 시작한다. 로컬의 오래된 updatedAt이 원격을 덮지 못하게 한다.
       if(remoteHasPlan){
         fbApplying=true;
-        mergeRemoteState(remote,keepStart);
+        applyRemoteState(remote,keepStart);
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
+        if(remoteRepaired){setTimeout(()=>{try{writeSharedState()}catch(e){}},800)}
       }else if(localHasPlan && S.updatedAt){
         // 원격이 정말 비어 있을 때만 내 데이터를 올린다.
-        try{ fbRef.set(sharedState()) }catch(e){}
+        try{ writeSharedState() }catch(e){}
       }
       fbReady=true;
       // 이후 다른 직원이 바꾸면 실시간 반영 — 단, 내 것보다 오래된 데이터는 무시
       fbRef.on('value', snap2=>{
         if(fbApplying) return;
         const r=snap2.val(); if(!r||!r.plan) return;
-        if((r.updatedAt||0) < (S.updatedAt||0)) return;  // 받은 게 내 것보다 오래됐으면 무시(옛 데이터가 새 걸 덮지 않게)
+        const remoteRepaired = stateRepairMissingTs(r,+r.updatedAt||Date.now());
+        // 칸별 저장시각으로 병합한다. 전체 updatedAt만 보고 원격 데이터를 버리지 않는다.
         // 사용자가 수정 중이면(식단 모달 / 발주 모달 / 입력 포커스) 원격 적용 자체를 미룬다 — 작업 중인 식단이 덮어써지지 않게
         if(menuEditing()){pendingRemoteState=r;return;}
         fbApplying=true;
@@ -591,6 +675,7 @@ function initFirebase(){
         try{localStorage.setItem(LS,JSON.stringify(S))}catch(e){}
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
+        if(remoteRepaired){setTimeout(()=>{try{writeSharedState()}catch(e){}},800)}
       });
     }).catch(()=>{ fbReady=false; });
   }catch(e){ /* 키가 잘못됐어도 localStorage로 계속 작동 */ }
@@ -1881,18 +1966,24 @@ initFirebase();   // Firebase 키가 있으면 공유 모드로 동기화 시작
    식단의 S / slotOf / MENU / DOW / fmt / addDays / esc / stripBox 재사용(읽기)
    ============================================================ */
 var ORD_VENDORS=['CJ','농림','트레이'];
-var ORD_RECIPE={}, ORD_ORDERED={}, ORD_CLEARED={}, ORD_QTY={};
-var ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},vendors:0};
+var ORD_RECIPE={}, ORD_ORDERED={}, ORD_CLEARED={}, ORD_QTY={}, ORD_PRICE={}, ORD_LEARN={};
+var ORD_COST={people:630,mealPrice:630,targetRate:35};
+var ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},vendors:0,cost:0};
 var ORD_LAST=null, ordFbRef=null, ordReady=false, ordApplying=false, ordSaveTimer=null, ordLastLocalSave=0, ordPendingRemote=null;
 try{var _or=localStorage.getItem('ord_recipe');if(_or)ORD_RECIPE=JSON.parse(_or);
     var _oo=localStorage.getItem('ord_ordered');if(_oo)ORD_ORDERED=JSON.parse(_oo);
     var _oc=localStorage.getItem('ord_cleared');if(_oc)ORD_CLEARED=JSON.parse(_oc);
     var _oq=localStorage.getItem('ord_qty');if(_oq)ORD_QTY=JSON.parse(_oq);
+    var _op=localStorage.getItem('ord_price');if(_op)ORD_PRICE=JSON.parse(_op);
+    var _ol=localStorage.getItem('ord_learn');if(_ol)ORD_LEARN=JSON.parse(_ol);
+    var _ocs=localStorage.getItem('ord_cost');if(_ocs)ORD_COST=Object.assign(ORD_COST,JSON.parse(_ocs));
     var _ov=localStorage.getItem('ord_vendors');if(_ov)ORD_VENDORS=JSON.parse(_ov);
     var _ot=localStorage.getItem('ord_ts');if(_ot)ORD_TS=JSON.parse(_ot);}catch(e){}
 function ordClone(v){return JSON.parse(JSON.stringify(v==null?null:v));}
-function ordNormTs(){ORD_TS=ORD_TS||{};['recipe','ordered','cleared','qty'].forEach(function(k){ORD_TS[k]=ORD_TS[k]||{};});ORD_TS.vendors=ORD_TS.vendors||0;}
-function ordSnapshotData(){return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),vendors:ordClone(ORD_VENDORS)};}
+function ordDefaultVendors(){return ['CJ','농림','트레이'];}
+function ordDefaultCost(){return {people:630,mealPrice:630,targetRate:35};}
+function ordNormTs(){ORD_TS=ORD_TS||{};['recipe','ordered','cleared','qty','price','learn'].forEach(function(k){ORD_TS[k]=ORD_TS[k]||{};});ORD_TS.vendors=ORD_TS.vendors||0;ORD_TS.cost=ORD_TS.cost||0;}
+function ordSnapshotData(){return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),price:ordClone(ORD_PRICE),learn:ordClone(ORD_LEARN),vendors:ordClone(ORD_VENDORS),cost:ordClone(ORD_COST)};}
 function ordSame(a,b){return JSON.stringify(a)==JSON.stringify(b);}
 function ordStampMap(kind,now,prev,at){
   var keys={};Object.keys(now||{}).forEach(function(k){keys[k]=1;});Object.keys(prev||{}).forEach(function(k){keys[k]=1;});
@@ -1904,25 +1995,111 @@ function ordStampDiff(){
   ordStampMap('ordered',now.ordered,prev.ordered,at);
   ordStampMap('cleared',now.cleared,prev.cleared,at);
   ordStampMap('qty',now.qty,prev.qty,at);
+  ordStampMap('price',now.price,prev.price,at);
+  ordStampMap('learn',now.learn,prev.learn,at);
   if(!ordSame(now.vendors,prev.vendors))ORD_TS.vendors=at;
+  if(!ordSame(now.cost,prev.cost))ORD_TS.cost=at;
   ORD_LAST=ordClone(now);
 }
 function ordWriteLocal(){try{localStorage.setItem('ord_recipe',JSON.stringify(ORD_RECIPE));
     localStorage.setItem('ord_ordered',JSON.stringify(ORD_ORDERED));
     localStorage.setItem('ord_cleared',JSON.stringify(ORD_CLEARED));
     localStorage.setItem('ord_qty',JSON.stringify(ORD_QTY));
+    localStorage.setItem('ord_price',JSON.stringify(ORD_PRICE));
+    localStorage.setItem('ord_learn',JSON.stringify(ORD_LEARN));
+    localStorage.setItem('ord_cost',JSON.stringify(ORD_COST));
     localStorage.setItem('ord_vendors',JSON.stringify(ORD_VENDORS));
     localStorage.setItem('ord_ts',JSON.stringify(ORD_TS));}catch(e){}}
-function ordSharedState(){ordNormTs();return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),vendors:ordClone(ORD_VENDORS),ts:ordClone(ORD_TS),updatedAt:Date.now()};}
-function ordHasData(){return Object.keys(ORD_RECIPE).length||Object.keys(ORD_ORDERED).length||Object.keys(ORD_CLEARED).length||Object.keys(ORD_QTY).length;}
+function ordSharedState(){ordNormTs();return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),price:ordClone(ORD_PRICE),learn:ordClone(ORD_LEARN),vendors:ordClone(ORD_VENDORS),cost:ordClone(ORD_COST),ts:ordClone(ORD_TS),updatedAt:Date.now()};}
+function ordEnsureState(r){
+  r=r||{};r.recipe=r.recipe||{};r.ordered=r.ordered||{};r.cleared=r.cleared||{};r.qty=r.qty||{};r.price=r.price||{};r.learn=r.learn||{};r.vendors=r.vendors||[];r.cost=r.cost||{};
+  r.ts=r.ts||{};['recipe','ordered','cleared','qty','price','learn'].forEach(function(k){r.ts[k]=r.ts[k]||{};});r.ts.vendors=r.ts.vendors||0;r.ts.cost=r.ts.cost||0;
+  return r;
+}
+function ordRepairStateTs(r,baseAt){
+  if(!r)return false;ordEnsureState(r);var at=+baseAt||+r.updatedAt||Date.now(),changed=false;
+  ['recipe','ordered','cleared','qty','price','learn'].forEach(function(kind){
+    Object.keys(r[kind]||{}).forEach(function(k){if(!(+r.ts[kind][k])){r.ts[kind][k]=at;changed=true;}});
+  });
+  if((r.vendors||[]).length&&!+r.ts.vendors){r.ts.vendors=at;changed=true;}
+  if(Object.keys(r.cost||{}).length&&!+r.ts.cost){r.ts.cost=at;changed=true;}
+  return changed;
+}
+function ordMaxTs(r){
+  r=r||{};var ts=r.ts||{},mx=+r.updatedAt||0;
+  ['recipe','ordered','cleared','qty','price','learn'].forEach(function(kind){Object.keys(ts[kind]||{}).forEach(function(k){mx=Math.max(mx,+ts[kind][k]||0);});});
+  mx=Math.max(mx,+ts.vendors||0,+ts.cost||0);
+  return mx||Date.now();
+}
+function ordMergeLocalIntoRemote(remote,local){
+  remote=ordEnsureState(remote||{});local=ordEnsureState(local||{});
+  ordRepairStateTs(remote,+remote.updatedAt||Date.now());ordRepairStateTs(local,+local.updatedAt||Date.now());
+  var out=ordEnsureState(ordClone(remote));
+  ['recipe','ordered','cleared','qty','price','learn'].forEach(function(kind){
+    var keys={};Object.keys((local.ts&&local.ts[kind])||{}).forEach(function(k){keys[k]=1;});Object.keys(local[kind]||{}).forEach(function(k){keys[k]=1;});
+    Object.keys(keys).forEach(function(k){
+      var lt=+(local.ts[kind]||{})[k]||0,rt=+(out.ts[kind]||{})[k]||0;
+      if(lt>rt){if(Object.prototype.hasOwnProperty.call(local[kind]||{},k))out[kind][k]=ordClone(local[kind][k]);else delete out[kind][k];out.ts[kind][k]=lt;}
+    });
+  });
+  if((+local.ts.vendors||0)>(+out.ts.vendors||0)){out.vendors=ordClone(local.vendors||[]);out.ts.vendors=+local.ts.vendors||Date.now();}
+  if((+local.ts.cost||0)>(+out.ts.cost||0)){out.cost=ordClone(local.cost||{});out.ts.cost=+local.ts.cost||Date.now();}
+  out.updatedAt=Math.max(ordMaxTs(out),ordMaxTs(local),ordMaxTs(remote));
+  return out;
+}
+function ordWriteSharedState(){
+  if(!ordFbRef)return;
+  var local=ordSharedState();
+  if(ordFbRef.transaction){return ordFbRef.transaction(function(current){return ordMergeLocalIntoRemote(current||{},local);},function(){},false);}
+  return ordFbRef.set(local);
+}
+function ordHasData(){return Object.keys(ORD_RECIPE).length||Object.keys(ORD_ORDERED).length||Object.keys(ORD_CLEARED).length||Object.keys(ORD_QTY).length||Object.keys(ORD_PRICE).length||Object.keys(ORD_LEARN).length;}
+function ordRemoteHasData(r){
+  if(!r)return false;
+  return ['recipe','ordered','cleared','qty','price','learn'].some(function(k){return r[k]&&Object.keys(r[k]).length;})
+    || (Array.isArray(r.vendors)&&r.vendors.length)
+    || (r.cost&&Object.keys(r.cost).length);
+}
 function ordSave(){ordStampDiff();ordWriteLocal();ordLastLocalSave=Date.now();
-  if(FB_ON&&ordReady&&ordFbRef&&!ordApplying){clearTimeout(ordSaveTimer);ordSaveTimer=setTimeout(function(){try{ordFbRef.set(ordSharedState());}catch(e){}},400);}
+  if(FB_ON&&ordReady&&ordFbRef&&!ordApplying){clearTimeout(ordSaveTimer);ordSaveTimer=setTimeout(function(){try{ordWriteSharedState();}catch(e){}},400);}
 }
 ORD_LAST=ordSnapshotData();
 /* 수량은 날짜별로 따로 저장 (재료·업체·재고는 메뉴별 기억) */
 function ordQK(date,meal,menu,ing){return date+'|'+meal+'|'+menu+'|'+ing;}
 function ordQtyGet(date,meal,menu,ing){if(!ing)return '';var v=ORD_QTY[ordQK(date,meal,menu,ing)];return v==null?'':v;}
 function ordQtySet(date,meal,menu,ing,q){if(!ing)return;var k=ordQK(date,meal,menu,ing);if(String(q||'').trim()===''){delete ORD_QTY[k];}else{ORD_QTY[k]=String(q).trim();}}
+function ordPriceGet(date,meal,menu,ing){if(!ing)return '';var v=ORD_PRICE[ordQK(date,meal,menu,ing)];return v==null?'':v;}
+function ordPriceSet(date,meal,menu,ing,v){if(!ing)return;var k=ordQK(date,meal,menu,ing),s=String(v||'').replace(/[^\d]/g,'');if(!s)delete ORD_PRICE[k];else ORD_PRICE[k]=s;}
+function ordNum(v){var n=parseInt(String(v||'').replace(/[^\d]/g,''),10);return isNaN(n)?0:n;}
+function ordMoney(n){n=ordNum(n);return n?n.toLocaleString('ko-KR')+'원':'-';}
+function ordLearnKey(menu,ing){return menu+'|'+(ing||'');}
+function ordLearnGet(menu,ing){return ORD_LEARN[ordLearnKey(menu,ing)]||{};}
+function ordLearnSet(menu,ing,field,val){if(!menu||!ing)return;var k=ordLearnKey(menu,ing),r=ORD_LEARN[k]||{};if(String(val||'').trim()==='')delete r[field];else r[field]=String(val).trim();if(Object.keys(r).length)ORD_LEARN[k]=r;else delete ORD_LEARN[k];}
+function ordLeadLabel(v){v=String(v||'');return v==='3'?'3일차 선발주':v==='4'?'4일전 선발주':v==='1'?'전날 선입고':'기본';}
+function ordLearnText(menu,ing){var r=ordLearnGet(menu,ing),a=[];if(r.state)a.push(r.state);if(r.adjust)a.push('다음 '+r.adjust);if(r.lead)a.push(ordLeadLabel(r.lead));if(r.memo)a.push(r.memo);return a.join(' · ');}
+function ordMealCost(date,meal){
+  var sum=0,items=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[];
+  items.forEach(function(it){(ORD_RECIPE[it.n]||[]).forEach(function(r){if(!r.stock&&r.ing)sum+=ordNum(ordPriceGet(date,meal,it.n,r.ing));});});
+  return sum;
+}
+function ordRangeCost(from,to){var sum=0;Object.keys(ORD_PRICE||{}).forEach(function(k){var d=k.split('|')[0];if(d>=from&&d<=to)sum+=ordNum(ORD_PRICE[k]);});return sum;}
+function ordMonthRange(){var y=S.start.slice(0,4),m=S.start.slice(5,7),last=new Date(+y,+m,0).getDate();return [y+'-'+m+'-01',y+'-'+m+'-'+String(last).padStart(2,'0')];}
+function ordMealCount(from,to){var c=0,d=from;while(d<=to){ordMeals().forEach(function(meal){var it=(S.plan[d]&&S.plan[d][meal]&&S.plan[d][meal].items)||[];if(it.length)c++;});d=addDays(d,1);}return c;}
+function ordRevenue(from,to){return ordNum(ORD_COST.people)*ordNum(ORD_COST.mealPrice)*ordMealCount(from,to);}
+function ordRate(amount,from,to){var rev=ordRevenue(from,to);return rev?Math.round((amount/rev*100)*10)/10:0;}
+function ordTarget(from,to){return Math.round(ordRevenue(from,to)*(ordNum(ORD_COST.targetRate)||35)/100);}
+function ordCostState(rate){var t=ordNum(ORD_COST.targetRate)||35;if(!rate)return '';return rate>t+1?' high':rate<t-1?' low':' ok';}
+function ordCostSummaryHtml(){
+  var wk=ordWeekDays(),mf=ordMonthRange(),wa=ordRangeCost(wk[0],wk[5]),ma=ordRangeCost(mf[0],mf[1]);
+  var wr=ordRate(wa,wk[0],wk[5]),mr=ordRate(ma,mf[0],mf[1]);
+  return '<div class="ocostbox">'
+    +'<div class="oworkref"><b>발주 기준</b><span>수량 · 재고 · 업체 · 선입고 · 지난 기록 · 금액</span></div>'
+    +'<div class="ocostset"><label>식수 <input value="'+esc(ORD_COST.people)+'" onchange="ordSetCost(\'people\',this.value)"></label><label>1식 <input value="'+esc(ORD_COST.mealPrice)+'" onchange="ordSetCost(\'mealPrice\',this.value)"></label><label>목표 <input value="'+esc(ORD_COST.targetRate)+'" onchange="ordSetCost(\'targetRate\',this.value)">%</label></div>'
+    +'<div class="ocostcards"><div class="ocostcard'+ordCostState(wr)+'"><b>주 금액</b><span>'+ordMoney(wa)+'</span><em>'+wr+'%</em></div>'
+    +'<div class="ocostcard'+ordCostState(mr)+'"><b>월 금액</b><span>'+ordMoney(ma)+'</span><em>'+mr+'%</em></div>'
+    +'<div class="ocostcard"><b>월 기준</b><span>'+ordMoney(ordTarget(mf[0],mf[1]))+'</span><em>'+(ORD_COST.targetRate||35)+'%</em></div></div></div>';
+}
+function ordSetCost(field,val){ORD_COST[field]=String(val||'').replace(/[^\d.]/g,'')||'0';ordSave();ordRenderBoard();}
 /* 업체는 재료(줄)마다 저장. 같은 재료가 여러 업체로 갈리면 '가장 많이 쓴 업체'가 기본(우선). 빈 줄은 기본을 따르고, 직접 고르면 그 줄만 바뀜 */
 function ordDefaultVendor(ing){if(!ing)return '';var cnt={},best='',bn=0;Object.keys(ORD_RECIPE).forEach(function(n){(ORD_RECIPE[n]||[]).forEach(function(r){if(!r.stock&&r.ing===ing&&r.vendor){cnt[r.vendor]=(cnt[r.vendor]||0)+1;if(cnt[r.vendor]>bn){bn=cnt[r.vendor];best=r.vendor;}}});});return best;}
 function ordVenOf(r){if(!r||r.stock||!r.ing)return '';return r.vendor||ordDefaultVendor(r.ing);}
@@ -1968,24 +2145,62 @@ function ordMergeMap(kind,target,remoteData,remoteTs){
 function ordApplyLegacyRemote(r){
   if(!r||!r.recipe)return false;
   if(ordHasData())return false;
-  ORD_RECIPE=ordClone(r.recipe||{});ORD_ORDERED=ordClone(r.ordered||{});ORD_CLEARED=ordClone(r.cleared||{});ORD_QTY=ordClone(r.qty||{});ORD_VENDORS=ordClone(r.vendors||ORD_VENDORS);
-  var at=r.updatedAt||Date.now();ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},vendors:at};
-  Object.keys(ORD_RECIPE).forEach(function(k){ORD_TS.recipe[k]=at;});Object.keys(ORD_ORDERED).forEach(function(k){ORD_TS.ordered[k]=at;});Object.keys(ORD_CLEARED).forEach(function(k){ORD_TS.cleared[k]=at;});Object.keys(ORD_QTY).forEach(function(k){ORD_TS.qty[k]=at;});
+  ORD_RECIPE=ordClone(r.recipe||{});ORD_ORDERED=ordClone(r.ordered||{});ORD_CLEARED=ordClone(r.cleared||{});ORD_QTY=ordClone(r.qty||{});ORD_PRICE=ordClone(r.price||{});ORD_LEARN=ordClone(r.learn||{});ORD_COST=Object.assign(ORD_COST,r.cost||{});ORD_VENDORS=ordClone(r.vendors||ORD_VENDORS);
+  var at=r.updatedAt||Date.now();ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},vendors:at,cost:at};
+  Object.keys(ORD_RECIPE).forEach(function(k){ORD_TS.recipe[k]=at;});Object.keys(ORD_ORDERED).forEach(function(k){ORD_TS.ordered[k]=at;});Object.keys(ORD_CLEARED).forEach(function(k){ORD_TS.cleared[k]=at;});Object.keys(ORD_QTY).forEach(function(k){ORD_TS.qty[k]=at;});Object.keys(ORD_PRICE).forEach(function(k){ORD_TS.price[k]=at;});Object.keys(ORD_LEARN).forEach(function(k){ORD_TS.learn[k]=at;});
   ORD_LAST=ordSnapshotData();ordWriteLocal();return true;
+}
+function ordApplyRemoteAuthority(r){
+  if(!r)return false;
+  var hadTs=!!r.ts;
+  r=ordClone(r);
+  ordEnsureState(r);
+  var repaired=false,at=+r.updatedAt||Date.now();
+  if(hadTs){repaired=ordRepairStateTs(r,at);}
+  else{
+    r.ts={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},vendors:0,cost:0};
+    ['recipe','ordered','cleared','qty','price','learn'].forEach(function(kind){
+      Object.keys(r[kind]||{}).forEach(function(k){r.ts[kind][k]=at;});
+    });
+    if((r.vendors||[]).length)r.ts.vendors=at;
+    if(Object.keys(r.cost||{}).length)r.ts.cost=at;
+    repaired=true;
+  }
+  ORD_RECIPE=ordClone(r.recipe||{});
+  ORD_ORDERED=ordClone(r.ordered||{});
+  ORD_CLEARED=ordClone(r.cleared||{});
+  ORD_QTY=ordClone(r.qty||{});
+  ORD_PRICE=ordClone(r.price||{});
+  ORD_LEARN=ordClone(r.learn||{});
+  ORD_VENDORS=ordClone((r.vendors&&r.vendors.length)?r.vendors:ordDefaultVendors());
+  ORD_COST=Object.assign(ordDefaultCost(),r.cost||{});
+  ORD_TS=ordClone(r.ts||{recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},vendors:0,cost:0});
+  ordNormTs();
+  ORD_LAST=ordSnapshotData();
+  ordWriteLocal();
+  return repaired;
 }
 function ordApplyRemote(r){
   if(!r)return false;
   if(!r.ts)return ordApplyLegacyRemote(r);
+  ordRepairStateTs(r,+r.updatedAt||Date.now());
   ordMergeMap('recipe',ORD_RECIPE,r.recipe,r.ts.recipe);
   ordMergeMap('ordered',ORD_ORDERED,r.ordered,r.ts.ordered);
   ordMergeMap('cleared',ORD_CLEARED,r.cleared,r.ts.cleared);
   ordMergeMap('qty',ORD_QTY,r.qty,r.ts.qty);
+  ordMergeMap('price',ORD_PRICE,r.price,r.ts.price);
+  ordMergeMap('learn',ORD_LEARN,r.learn,r.ts.learn);
   if((+((r.ts||{}).vendors)||0)>(+ORD_TS.vendors||0)){ORD_VENDORS=ordClone(r.vendors||ORD_VENDORS);ORD_TS.vendors=+r.ts.vendors||Date.now();}
+  if((+((r.ts||{}).cost)||0)>(+ORD_TS.cost||0)){ORD_COST=Object.assign(ORD_COST,r.cost||{});ORD_TS.cost=+r.ts.cost||Date.now();}
   ORD_LAST=ordSnapshotData();ordWriteLocal();return true;
 }
 function ordEditing(){
   var oov=document.getElementById('oov'),ovv=document.getElementById('ovv');
-  return (oov&&oov.classList.contains('on'))||(ovv&&ovv.classList.contains('on'))||(document.activeElement&&/TEXTAREA|INPUT/.test(document.activeElement.tagName));
+  var orderOpen=!!(oov&&oov.classList.contains('on'));
+  var vendorOpen=!!(ovv&&ovv.classList.contains('on'));
+  var ae=document.activeElement;
+  var activeInput=!!(ae&&/TEXTAREA|INPUT/.test(ae.tagName)&&ae.offsetParent!==null);
+  return orderOpen||vendorOpen||activeInput;
 }
 function ordApplyPendingRemote(){
   if(!ordPendingRemote||ordEditing())return;
@@ -1998,16 +2213,21 @@ function ordInitFirebase(){
     ordFbRef=firebase.database().ref('menuplan_order');
     ordFbRef.once('value').then(function(snap){
       var r=snap.val();
+      var hasRemote=ordRemoteHasData(r);
+      var repaired=false;
       ordApplying=true;
-      if(r&&r.recipe){ordApplyRemote(r);}
-      else if(ordHasData()){try{ordFbRef.set(ordSharedState());}catch(e){}}
+      if(hasRemote){repaired=ordApplyRemoteAuthority(r);}
+      else if(ordHasData()){try{ordWriteSharedState();}catch(e){}}
       ordApplying=false;ordReady=true;
+      if(repaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
       ordFbRef.on('value',function(snap2){
         if(ordApplying)return;
         var rr=snap2.val();if(!rr)return;
+        var rrRepaired=rr&&rr.ts?ordRepairStateTs(rr,+rr.updatedAt||Date.now()):false;
         if(ordEditing()){ordPendingRemote=rr;return;}
         ordApplying=true;ordApplyRemote(rr);ordApplying=false;
         if(typeof ordRenderBoard==='function')ordRenderBoard();
+        if(rrRepaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
       });
     }).catch(function(){ordReady=false;});
   }catch(e){}
@@ -2027,6 +2247,8 @@ function ordCell(date,meal){
   var items=ordSortItems(raw);
   var done=!!ORD_ORDERED[date+'|'+meal];
   var h='<div class="ocfmrow"><button class="ocfm'+(done?' done':'')+'" onclick="event.stopPropagation();ordToggleCell(\''+date+'\',\''+meal+'\')" title="재료담기 완료 표시 (다시 누르면 해제)">발주</button></div>';
+  var cost=ordMealCost(date,meal);
+  if(cost)h+='<div class="ocellcost">'+ordMoney(cost)+'</div>';
   items.forEach(function(it){
     h+='<div class="ogmn">'+esc(ordDisp(it.n))+'</div>';
     var rec=ORD_RECIPE[it.n]||[];
@@ -2052,6 +2274,7 @@ function ordRenderBoard(){
   var days=ordWeekDays();
   var h='<div class="osub"><div class="owkh">'+fmt(days[0])+' ~ '+fmt(days[5])+'</div>'
        +'<button class="ovbtn" onclick="ordOpenVendor()">업체</button></div>';
+  h+=ordCostSummaryHtml();
   h+='<div class="grid"><div class="hd"></div>';
   days.forEach(function(d,i){h+='<div class="hd">'+fmt(d)+'('+DOW[i]+')</div>';});
   h+='<div class="hd sun">'+fmt(addDays(S.start,6))+'(일)</div>';
@@ -2166,7 +2389,7 @@ function ordFb(t){var ta=document.createElement('textarea');ta.value=t;document.
 
 /* ===== 발주 모달 (메뉴 읽기전용 + 재료 입력 + [완료]) ===== */
 function ordOpenModal(date,meal){ordModal={date:date,meal:meal};ordRenderModal();document.getElementById('oov').classList.add('on');}
-function ordCloseModal(){ordTrim();document.getElementById('oov').classList.remove('on');ordModal=null;ordSave();ordApplyPendingRemote();ordRenderBoard();}
+function ordCloseModal(){ordTrim();document.getElementById('oov').classList.remove('on');ordModal=null;ordSave();ordApplyPendingRemote();if(typeof applyPendingRemoteState==='function')applyPendingRemoteState();ordRenderBoard();}
 function ordSortItems(raw){
   var SO={'메인':0,'국':1,'반찬':2,'기본':3,'후식':4};
   return raw.map(function(it,idx){return {it:it,idx:idx};}).sort(function(a,b){
@@ -2201,20 +2424,40 @@ function ordRenderModal(){
       h+='<input id="oing_'+mi+'_'+ii+'" class="oing" value="'+esc(r.ing||'')+'" placeholder="재료" onchange="ordSetIng('+mi+','+ii+',this.value)" onkeydown="ordKey(event,'+mi+','+ii+',\'ing\')">';
       if(stk){h+='<span class="oqu ostkph">—</span>';}
       else{h+='<input id="oqu_'+mi+'_'+ii+'" class="oqu" value="'+esc(ordQtyGet(ordModal.date,ordModal.meal,name,r.ing))+'" placeholder="수량" onchange="ordSetQ('+mi+','+ii+',this.value)" onkeydown="ordKey(event,'+mi+','+ii+',\'q\')">';}
+      if(stk){h+='<span class="oamt ostkph">—</span>';}
+      else{h+='<input id="oamt_'+mi+'_'+ii+'" class="oamt" value="'+esc(ordPriceGet(ordModal.date,ordModal.meal,name,r.ing))+'" placeholder="금액" onchange="ordSetAmt('+mi+','+ii+',this.value)" onkeydown="ordKey(event,'+mi+','+ii+',\'amt\')">';}
       var rv=ordVenOf(r);
       var slotLabel=stk?'재고':(rv||'업체');
       var slotCls='ovenslot'+(stk?' isstk':(rv?'':' empty'))+(ordChipKey===ck?' open':'');
       h+='<button id="oven_'+mi+'_'+ii+'" class="'+slotCls+'" onclick="ordChip('+mi+','+ii+')">'+esc(slotLabel)+'</button>';
       h+='<button class="odel" onclick="ordDel('+mi+','+ii+')" aria-label="삭제">×</button>';
       h+='</div>';
+      var ltxt=ordLearnText(name,r.ing);
+      if(ltxt)h+='<div class="olast">이전 기록 · '+esc(ltxt)+'</div>';
       if(ordChipKey===ck){
+        var lr=ordLearnGet(name,r.ing),st=lr.state||'';
         h+='<div class="ovedit"><div class="ovrow">';
         ORD_VENDORS.forEach(function(v){
           var on=(!stk && rv===v);var ve=v.replace(/'/g,"\\'");
           h+='<button class="ovchip'+(on?' on':'')+'" onclick="ordPickVen('+mi+','+ii+',\''+ve+'\')">'+esc(v)+'</button>';
         });
         h+='<button class="ovchip ovstk'+(stk?' on':'')+'" onclick="ordPickStock('+mi+','+ii+')">재고</button>';
-        h+='</div></div>';
+        h+='</div>';
+        if(r.ing){
+          h+='<div class="olearn"><div class="ollabel">다음 발주에 기억</div><div class="olrow">';
+          ['적정','부족','남음'].forEach(function(v){h+='<button class="olchip'+(st===v?' on':'')+'" onclick="ordSetLearn('+mi+','+ii+',\'state\',\''+v+'\')">'+v+'</button>';});
+          h+='</div><div class="olrow">';
+          h+='<input value="'+esc(lr.adjust||'')+'" placeholder="다음 수량 예: -10kg / 90kg" onchange="ordSetLearn('+mi+','+ii+',\'adjust\',this.value)">';
+          h+='<select onchange="ordSetLearn('+mi+','+ii+',\'lead\',this.value)">'
+            +'<option value=""'+(!lr.lead?' selected':'')+'>기본일</option>'
+            +'<option value="1"'+(String(lr.lead)==='1'?' selected':'')+'>전날 선입고</option>'
+            +'<option value="3"'+(String(lr.lead)==='3'?' selected':'')+'>3일차 선발주</option>'
+            +'<option value="4"'+(String(lr.lead)==='4'?' selected':'')+'>4일전 선발주</option>'
+            +'</select></div>';
+          h+='<input class="olmemo" value="'+esc(lr.memo||'')+'" placeholder="특이사항 예: 지난번 100kg 부족, 다음은 110kg" onchange="ordSetLearn('+mi+','+ii+',\'memo\',this.value)">';
+          h+='</div>';
+        }
+        h+='</div>';
       }
     });
     h+='</div>';
@@ -2227,6 +2470,8 @@ function ordSetIng(mi,ii,v){var r=ordRecOf(mi);if(!r||!r[ii])return;r[ii].ing=v.
   if(btn&&!r[ii].stock){var ev=ordVenOf(r[ii]);var open=(ordChipKey===mi+':'+ii)?' open':'';btn.textContent=ev||'업체';btn.className='ovenslot'+(ev?'':' empty')+open;}
 }
 function ordSetQ(mi,ii,v){if(!ordModal)return;var it=ordItems()[mi];var r=ordRecOf(mi);if(!it||!r||!r[ii])return;ordQtySet(ordModal.date,ordModal.meal,it.n,r[ii].ing,v);ordSave();}
+function ordSetAmt(mi,ii,v){if(!ordModal)return;var it=ordItems()[mi];var r=ordRecOf(mi);if(!it||!r||!r[ii])return;ordPriceSet(ordModal.date,ordModal.meal,it.n,r[ii].ing,v);ordSave();ordRenderBoard();}
+function ordSetLearn(mi,ii,field,val){var it=ordItems()[mi];var r=ordRecOf(mi);if(!it||!r||!r[ii]||!r[ii].ing)return;ordLearnSet(it.n,r[ii].ing,field,val);ordSave();ordRenderModal();ordRenderBoard();}
 function ordSetVen(mi,ii,v){var r=ordRecOf(mi);if(!r||!r[ii])return;r[ii].vendor=v;ordSave();}
 function ordChip(mi,ii){var ck=mi+':'+ii;ordChipKey=(ordChipKey===ck)?null:ck;ordRenderModal();}
 function ordPickVen(mi,ii,v){var r=ordRecOf(mi);if(!r||!r[ii])return;r[ii].stock=false;r[ii].vendor=v;ordChipKey=null;ordSave();ordRenderModal();}
@@ -2234,8 +2479,9 @@ function ordPickStock(mi,ii){var r=ordRecOf(mi);if(!r||!r[ii])return;r[ii].stock
 function ordAddVendor(){var nv=(prompt('새 업체 이름')||'').trim();if(!nv)return;if(ORD_VENDORS.indexOf(nv)<0){ORD_VENDORS.push(nv);ordSave();}ordRenderVendor();}
 function ordDelVendor(v){if(ORD_VENDORS.length<=1){ordToast('업체는 하나 이상 있어야 해요');return;}if(!confirm('업체 “'+v+'” 지울까요?'))return;ORD_VENDORS=ORD_VENDORS.filter(function(x){return x!==v;});Object.keys(ORD_RECIPE).forEach(function(n){(ORD_RECIPE[n]||[]).forEach(function(r){if(r.vendor===v)r.vendor='';});});ordSave();ordRenderVendor();}
 function ordFocus(mi,ii,field){
-  var el=document.getElementById('o'+(field==='q'?'qu':'ing')+'_'+mi+'_'+ii);
-  if(!el&&field==='q')el=document.getElementById('oing_'+mi+'_'+ii);
+  var pre=field==='q'?'oqu':field==='amt'?'oamt':'oing';
+  var el=document.getElementById(pre+'_'+mi+'_'+ii);
+  if(!el&&(field==='q'||field==='amt'))el=document.getElementById('oing_'+mi+'_'+ii);
   if(el){el.focus();if(el.setSelectionRange){var L=el.value.length;try{el.setSelectionRange(L,L);}catch(e){}}return true;}
   return false;
 }
@@ -2245,6 +2491,8 @@ function ordKey(e,mi,ii,field){
   if(k==='Enter'){e.preventDefault();ordInsertRow(mi,ii);return;}
   var el=e.target,atEnd=(el.selectionStart===el.value.length&&el.selectionStart===el.selectionEnd),atStart=(el.selectionStart===0&&el.selectionEnd===0);
   if(k==='ArrowRight'&&field==='ing'&&atEnd){if(ordFocus(mi,ii,'q'))e.preventDefault();return;}
+  if(k==='ArrowRight'&&field==='q'&&atEnd){if(ordFocus(mi,ii,'amt'))e.preventDefault();return;}
+  if(k==='ArrowLeft'&&field==='amt'&&atStart){if(ordFocus(mi,ii,'q'))e.preventDefault();return;}
   if(k==='ArrowLeft'&&field==='q'&&atStart){if(ordFocus(mi,ii,'ing'))e.preventDefault();return;}
   if(k==='ArrowDown'){if(ordFocus(mi,ii+1,field))e.preventDefault();return;}
   if(k==='ArrowUp'){if(ordFocus(mi,ii-1,field))e.preventDefault();return;}
@@ -2279,6 +2527,22 @@ var _ott;function ordToast(msg){var t=document.getElementById('otoast');if(!t){t
 .otog{font-size:13px;font-weight:700;padding:7px 15px;border-radius:9px;border:1px solid #E2EAE5;background:#fff;color:#6B7B73;cursor:pointer;font-family:inherit}
 .otog.on{background:#2C6FB8;border-color:#2C6FB8;color:#fff}
 .owkh{font-size:13px;font-weight:800;color:#1C5187;margin:0 2px 11px}
+.ocostbox{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 2px 14px;padding:9px 12px;border:1px solid #E2EAE5;border-radius:10px;background:#FAFBFA}
+.oworkref{min-width:210px;display:grid;gap:2px}
+.oworkref b{font-size:12.5px;font-weight:900;color:#1C5187}
+.oworkref span{font-size:11.5px;font-weight:700;color:#6B7B73;white-space:nowrap}
+.ocostset{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ocostset label{font-size:12px;font-weight:800;color:#52645C;display:inline-flex;align-items:center;gap:5px}
+.ocostset input{width:58px;border:1px solid #D8E2DD;border-radius:7px;padding:6px 7px;font:inherit;font-size:12px;font-weight:800;color:#1A2420;background:#fff;text-align:right}
+.ocostcards{display:flex;gap:8px;align-items:stretch;flex-wrap:wrap;justify-content:flex-end}
+.ocostcard{min-width:88px;border:1px solid #D8E2DD;border-radius:8px;background:#fff;padding:6px 9px;display:grid;gap:1px}
+.ocostcard b{font-size:11.5px;color:#6B7B73}
+.ocostcard span{font-size:13px;font-weight:900;color:#1A2420}
+.ocostcard em{font-style:normal;font-size:11px;font-weight:900;color:#1C5187;text-align:right}
+.ocostcard.high{border-color:#E8B6B0;background:#FFF7F6}
+.ocostcard.high em{color:#C9534B}
+.ocostcard.low{border-color:#CFE0F0;background:#F4F8FC}
+.ocostcard.ok{border-color:#BFDCCF;background:#F7FCF9}
 .oc{cursor:pointer;position:relative}
 .oc:hover{border-color:#2C6FB8}
 .oc.oordered{border-color:#BFD3EC}
@@ -2325,10 +2589,11 @@ var _ott;function ordToast(msg){var t=document.getElementById('otoast');if(!t){t
 .omh{display:flex;align-items:center;gap:7px;margin:12px 0 6px}
 .omh .oslot{font-size:10.5px;font-weight:700;color:#6B7B73;background:#F1F4F2;padding:3px 7px;border-radius:5px}
 .omh .omn{font-size:15.5px;font-weight:800;color:#1A2420}
-.oerow{display:flex;align-items:center;gap:6px;padding:5px 0}
+.oerow{display:grid;grid-template-columns:minmax(86px,1fr) 64px 74px auto 20px;align-items:center;gap:6px;padding:5px 0}
 .oerow input{font-family:inherit;border:1px solid #E2EAE5;border-radius:8px;padding:8px 9px;font-size:14px;background:#fff;color:#1A2420}
-.oing{flex:1;min-width:0}
-.oqu{width:74px}
+.oing{width:100%;min-width:0}
+.oqu{width:100%;min-width:0}
+.oamt{width:100%;min-width:0;text-align:right}
 .oven{font-family:inherit;border:1px solid #E2EAE5;border-radius:8px;padding:8px 6px;font-size:13px;font-weight:700;color:#1C5187;background:#fff;width:80px}
 .ostocklbl{flex:1;text-align:right;color:#A6B4AC;font-size:13px;font-weight:700;padding-right:4px}
 .ostkb{font-size:11.5px;font-weight:800;color:#6B7B73;background:#fff;border:1px solid #E2EAE5;border-radius:8px;padding:7px 9px;cursor:pointer;white-space:nowrap;font-family:inherit}
@@ -2363,6 +2628,16 @@ var _ott;function ordToast(msg){var t=document.getElementById('otoast');if(!t){t
 .ovchip.ovstk.on{background:#6E7D75;border-color:#6E7D75;color:#fff}
 .ovchip.ovadd{font-weight:800}
 .ovx{display:inline-block;margin-left:6px;font-weight:800;color:#fff;background:#C9534B;border-radius:50%;width:15px;height:15px;line-height:15px;text-align:center;font-size:11px}
+.olast{font-size:11.5px;font-weight:700;color:#6B7B73;background:#F7FAFE;border-left:3px solid #C7D9EE;margin:0 0 5px 2px;padding:4px 7px;line-height:1.45}
+.olearn{margin-top:9px;border-top:1px dashed #D8E6F4;padding-top:9px;display:grid;gap:7px}
+.ollabel{font-size:11.5px;font-weight:900;color:#1C5187}
+.olrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.olchip{font-size:12px;font-weight:800;border:1px solid #D8E2DD;background:#fff;color:#6B7B73;border-radius:7px;padding:6px 10px;cursor:pointer;font-family:inherit}
+.olchip.on{background:#2C6FB8;border-color:#2C6FB8;color:#fff}
+.olearn input,.olearn select{font-family:inherit;border:1px solid #D8E2DD;border-radius:8px;background:#fff;color:#1A2420;padding:8px 9px;font-size:13px;min-width:0}
+.olearn .olrow input{flex:1}
+.olearn select{width:118px}
+.olearn .olmemo{width:100%;box-sizing:border-box}
 .ovtidy{margin-left:auto;font-size:11.5px;font-weight:700;color:#6B7B73;background:#fff;border:1px solid #E2EAE5;border-radius:7px;padding:6px 10px;cursor:pointer;font-family:inherit}
 .ovtidy.on{background:#C9534B;border-color:#C9534B;color:#fff}
 .ovv{position:fixed;inset:0;background:rgba(20,30,26,.34);z-index:62;display:none}
@@ -2381,6 +2656,7 @@ var _ott;function ordToast(msg){var t=document.getElementById('otoast');if(!t){t
 .ocfm{font-size:10.5px;font-weight:800;font-family:inherit;border:1px solid #BFD3EC;background:#fff;color:#1C5187;border-radius:7px;padding:3px 10px;cursor:pointer}
 .ocfm:hover{background:#E7F0FB}
 .ocfm.done{background:#2C6FB8;border-color:#2C6FB8;color:#fff}
+.ocellcost{font-size:11px;font-weight:900;color:#1C5187;background:#E7F0FB;border:1px solid #C7D9EE;border-radius:7px;padding:3px 7px;margin:0 0 4px;text-align:right}
 .opchips{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:13px 0 2px}
 .opchip{font-size:12.5px;font-weight:700;border:1px solid #E2EAE5;background:#fff;color:#6B7B73;border-radius:8px;padding:7px 13px;cursor:pointer;font-family:inherit}
 .opchip.on{background:#2C6FB8;border-color:#2C6FB8;color:#fff}
