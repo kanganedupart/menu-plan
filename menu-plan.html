@@ -39,8 +39,8 @@ border-radius:999px;padding:6px 10px;white-space:nowrap}
 .syncbadge.busy{color:#7A642B;background:#FFF8E8;border-color:#EBD9A9}
 .syncbadge.bad{color:var(--red);background:var(--redbg);border-color:#E9C4BC}
 .syncbadge.warn{color:#8A5A13;background:#FFF6E6;border-color:#E9C98B}
-.centralgate{position:fixed;inset:0;z-index:99999;background:rgba(248,251,249,.96);display:none;align-items:center;justify-content:center;padding:22px;text-align:center;color:var(--ink)}
-.centralgate.on{display:flex}
+.centralgate{display:none!important}
+.centralgate.on{display:none!important}
 .centralgate .box{width:min(440px,100%);background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:0 18px 44px rgba(20,40,30,.18);padding:26px 24px}
 .centralgate b{display:block;font-size:18px;margin-bottom:8px;color:var(--gd)}
 .centralgate span{display:block;font-size:14px;line-height:1.6;color:var(--mut);white-space:pre-line}
@@ -440,7 +440,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260627_1100_order_learn_input_save'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260627_1208_order_empty_dirty_delta'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -533,8 +533,40 @@ function stripTransientState(st){
 function sharedState(){
   const out=JSON.parse(JSON.stringify(S));
   stripTransientState(out);
-  stateRepairMissingTs(out,Date.now());
+  if(!FB_ON||fbReady)stateRepairMissingTs(out,Date.now());
   delete out.start;
+  return out;
+}
+function ensureDirtyTs(kind,key){
+  stateEnsureShape(S);
+  const at=nowStamp();
+  S._ts[kind]=S._ts[kind]||{};
+  if(!(+S._ts[kind][key]))S._ts[kind][key]=at;
+  return S._ts[kind][key];
+}
+function sharedDirtyState(){
+  const out={plan:{},confirmed:{},fix:{},cleared:{},saved:[],skip:[],_ts:{plan:{},confirmed:{},fix:{},cleared:{},saved:0,savedItems:{},skip:0},updatedAt:S.updatedAt||Date.now(),planLogicVer:PLAN_LOGIC_VER};
+  stateEnsureShape(S);
+  Object.keys(DIRTY.plan||{}).forEach(k=>{
+    if(isTransientPlanKey(k))return;
+    const cell=remoteCell(S.plan,k);
+    if(cell!==undefined)stateSetPlanCell(out.plan,k,cell);
+    out._ts.plan[k]=ensureDirtyTs('plan',k);
+  });
+  ['confirmed','fix','cleared'].forEach(kind=>{
+    Object.keys(DIRTY[kind]||{}).forEach(k=>{
+      if(Object.prototype.hasOwnProperty.call(S[kind]||{},k))out[kind][k]=stateClone(S[kind][k]);
+      out._ts[kind][k]=ensureDirtyTs(kind,k);
+    });
+  });
+  if(DIRTY.saved){
+    const sm=savedToMap(S.saved||[]),ids=Object.keys(DIRTY.savedItems||{});
+    ids.forEach(id=>{if(sm[id])out.saved.push(stateClone(sm[id]));out._ts.savedItems[id]=S._ts.savedItems[id]||nowStamp();});
+    out._ts.saved=Math.max(0,...Object.values(out._ts.savedItems).map(v=>+v||0));
+  }
+  // Firebase 최초 로딩 전에는 오래된 localStorage의 skip 배열 전체를 승격하지 않는다.
+  out.updatedAt=Math.max(+out.updatedAt||0,stateMaxTs(out));
+  stripTransientState(out);delete out.start;
   return out;
 }
 function stateMaxTs(st){
@@ -633,7 +665,7 @@ function writeSharedState(){
 }
 function writeFullSharedState(){
   if(!fbRef)return Promise.resolve(false);
-  const local=sharedState();
+  const local=(FB_ON&&!fbReady)?sharedDirtyState():sharedState();
   if(fbRef.transaction){
     return fbRef.transaction(function(current){
       current=current||{};
@@ -699,8 +731,8 @@ function applyFixesToMenu(){
   enforceCoreMenus();
 }
 let STATE_LAST=null;
-let DIRTY={plan:{},confirmed:{},fix:{},cleared:{},saved:false,skip:false,meta:false,full:false};
-function dirtyReset(){DIRTY={plan:{},confirmed:{},fix:{},cleared:{},saved:false,skip:false,meta:false,full:false};}
+let DIRTY={plan:{},confirmed:{},fix:{},cleared:{},saved:false,savedItems:{},skip:false,meta:false,full:false};
+function dirtyReset(){DIRTY={plan:{},confirmed:{},fix:{},cleared:{},saved:false,savedItems:{},skip:false,meta:false,full:false};}
 function dirtyMark(kind,key){
   if(kind==='saved'||kind==='skip'||kind==='meta'||kind==='full'){DIRTY[kind]=true;return;}
   DIRTY[kind]=DIRTY[kind]||{};
@@ -741,7 +773,7 @@ function stateStampDiff(){
     S._ts.saved=at;S._ts.savedItems=S._ts.savedItems||{};
     const nm=savedToMap(now.saved),pm=savedToMap(prev.saved),keys={};
     Object.keys(nm).forEach(k=>keys[k]=1);Object.keys(pm).forEach(k=>keys[k]=1);
-    Object.keys(keys).forEach(k=>{if(!stateSame(nm[k],pm[k]))S._ts.savedItems[k]=at;});
+    Object.keys(keys).forEach(k=>{if(!stateSame(nm[k],pm[k])){S._ts.savedItems[k]=at;DIRTY.savedItems[k]=1;}});
     dirtyMark('saved');
   }
   if(!stateSame(now.skip,prev.skip)){S._ts.skip=at;dirtyMark('skip');}
@@ -833,31 +865,37 @@ let saveQueued=false;
 let saveRetryTimer=null;
 let lastSaveProblemAt=0;
 let lastSaveProblemText='';
-let centralGate={menu:!FB_ON,order:!FB_ON,locked:!!FB_ON,lastDetail:''};
+let centralGate={menu:!FB_ON,order:!FB_ON,locked:false,lastDetail:'',timer:null,pendingMsg:''};
 function centralGateEl(){
   let el=document.getElementById('centralGate');
   if(el)return el;
   el=document.createElement('div');
   el.id='centralGate';
-  el.className='centralgate on';
-  el.innerHTML='<div class="box"><b id="centralGateTitle">공유 저장소 확인 중</b><span id="centralGateText">잠시만 기다려 주세요.</span></div>';
+  el.className='centralgate';
+  el.innerHTML='';
   document.body.appendChild(el);
   return el;
 }
 function centralGateHold(msg,detail){
   if(!FB_ON)return;
-  centralGate.locked=true;
+  centralGate.locked=false;
   centralGate.lastDetail=detail?String(detail):centralGate.lastDetail;
-  const el=centralGateEl();
-  const tx=document.getElementById('centralGateText');
-  if(tx)tx.textContent=msg||'공유 저장소를 확인하고 있습니다.\n관리자에게 연결 점검을 요청해 주세요.';
-  el.classList.add('on');
+  if(centralGate.timer){clearTimeout(centralGate.timer);centralGate.timer=null;}
+  const el=document.getElementById('centralGate');
+  if(el)el.classList.remove('on');
   if(detail&&window.console)console.warn('[central-save-check]',detail);
+}
+function centralGateWait(msg,delay){
+  if(!FB_ON)return;
+  centralGate.locked=false;
+  centralGate.pendingMsg=msg||'';
+  if(centralGate.timer)clearTimeout(centralGate.timer);
 }
 function centralGateReleaseIfReady(){
   if(!FB_ON){centralGate.locked=false;return true;}
   if(centralGate.menu){
     centralGate.locked=false;
+    if(centralGate.timer){clearTimeout(centralGate.timer);centralGate.timer=null;}
     const el=document.getElementById('centralGate');
     if(el)el.classList.remove('on');
     return true;
@@ -878,7 +916,11 @@ function centralMarkBlocked(kind,e){
     if(typeof ordRenderBoard==='function')ordRenderBoard();
     return;
   }
-  centralGateHold('공유 저장소를 확인하고 있습니다.\n관리자에게 연결 점검을 요청해 주세요.',(kind||'shared')+': '+describeSaveError(e));
+  centralGate.locked=false;
+  centralGate.lastDetail=(kind||'shared')+': '+describeSaveError(e);
+  const el=document.getElementById('centralGate');
+  if(el)el.classList.remove('on');
+  if(window.console)console.warn('[central-save-check]',centralGate.lastDetail);
 }
 function centralWriteProbe(rootRef,label){
   if(!FB_ON||!rootRef)return Promise.resolve(true);
@@ -889,20 +931,12 @@ function centralWriteProbe(rootRef,label){
 }
 function centralReadyForWrite(kind){
   if(!FB_ON)return true;
-  if(kind==='order')return !!(centralGate.order&&ordReady&&ordFbRef&&!centralGate.locked);
-  return !!(centralGate.menu&&fbReady&&fbRef&&!centralGate.locked);
+  if(kind==='order')return !!(centralGate.order&&ordReady&&ordFbRef);
+  return !!(centralGate.menu&&fbReady&&fbRef);
 }
 function centralGuardWrite(kind){
   if(centralReadyForWrite(kind))return true;
-  if(kind==='order'){
-    const msg='발주 공유 저장소 권한 확인이 필요합니다. 관리자에게 Firebase 발주 권한 설정을 요청해 주세요.';
-    if(typeof ordToast==='function')ordToast(msg);
-    else if(typeof toast==='function')toast(msg,false);
-    if(typeof ordRenderBoard==='function')ordRenderBoard();
-    return false;
-  }
-  centralGateHold('공유 저장소 확인이 끝난 뒤 수정할 수 있습니다.\n잠시 후에도 그대로면 관리자에게 연결 점검을 요청해 주세요.');
-  return false;
+  return true;
 }
 function setSyncBadge(kind,msg){
   syncState=kind||syncState;
@@ -933,7 +967,9 @@ function showSaveProblem(e){
   const now=Date.now();
   if(msg===lastSaveProblemText && now-lastSaveProblemAt<15000)return;
   lastSaveProblemText=msg;lastSaveProblemAt=now;
-  centralGateHold('공유 저장소를 확인하고 있습니다.\n관리자에게 연결 점검을 요청해 주세요.',msg);
+  centralGate.lastDetail=msg;
+  setSyncBadge('warn','공유 확인 필요');
+  if(window.console)console.warn('[shared-save]',msg);
 }
 function showBootMessage(msg,bad){
   const el=document.getElementById('weeks');
@@ -1002,17 +1038,16 @@ function queueSharedStateWrite(){
 }
 function flushBeforeLeave(){
   try{
-    stateRepairMissingTs(S,Date.now());
+    if(!FB_ON||fbReady)stateRepairMissingTs(S,Date.now()); else stateEnsureShape(S);
     localStorage.setItem(LS,JSON.stringify(S));
     if(FB_ON&&centralReadyForWrite())flushSharedStateNow();
     if(typeof ordFlushBeforeLeave==='function')ordFlushBeforeLeave();
   }catch(e){}
 }
 const save=()=>{
-  if(!centralGuardWrite())return false;
   backupStoredState('before-save');
   stateStampDiff();
-  stateRepairMissingTs(S,Date.now());
+  if(!FB_ON||fbReady)stateRepairMissingTs(S,Date.now()); else stateEnsureShape(S);
   lastLocalSave=Date.now();
   S.planLogicVer=PLAN_LOGIC_VER;
   S.updatedAt=nowStamp();          // 저장 시각 — 충돌 시 더 최근 것이 이긴다
@@ -1028,13 +1063,6 @@ const save=()=>{
   }
 };
 window.addEventListener('pagehide',flushBeforeLeave);
-window.addEventListener('beforeunload',flushBeforeLeave);
-window.addEventListener('beforeunload',e=>{
-  if(FB_ON&&(centralGate.locked||saveInFlight||saveQueued||ordSaveInFlight||ordSaveQueued)){
-    e.preventDefault();
-    e.returnValue='';
-  }
-});
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='hidden')flushBeforeLeave();
   else{applyPendingRemoteState();maybeReloadForUpdate();}
@@ -1042,9 +1070,7 @@ document.addEventListener('visibilitychange',()=>{
 /* Firebase 시작 — 키가 있을 때만. 최신 데이터를 받아와 화면 갱신, 이후 실시간 동기화 */
 function initFirebase(){
   if(!FB_ON) return;
-  centralGateHold('공유 저장소를 확인하고 있습니다.\n잠시만 기다려 주세요.');
   setSyncBadge('busy','공유 연결 중');
-  showBootMessage('공유 식단을 불러오는 중입니다. 잠시만 기다려 주세요.');
   try{
     firebase.initializeApp(window.FIREBASE_CONFIG);
     fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
@@ -1061,8 +1087,12 @@ function initFirebase(){
         let bootRemote=remote;
         let mergedPending=false;
         if(pendingLocal&&localHasPlan){
-          bootRemote=mergeLocalIntoRemote(remote,sharedState());
-          mergedPending=true;
+          if(dirtyAny()){
+            bootRemote=mergeLocalIntoRemote(remote,sharedDirtyState());
+            mergedPending=true;
+          }else{
+            clearPendingShared();
+          }
         }
         fbApplying=true;
         applyRemoteState(bootRemote,keepStart);
@@ -1106,8 +1136,8 @@ function initFirebase(){
         if(typeof render==='function'){buildPeriod(S.start);render()}
         if(remoteRepaired){dirtyMark('full');setTimeout(()=>{try{writeFullSharedState().then(()=>dirtyReset()).catch(e=>showSaveProblem(e))}catch(e){showSaveProblem(e)}},800)}
       });
-    }).catch((e)=>{ fbReady=false;centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요');showBootMessage('공유 저장소를 확인하고 있습니다. 관리자에게 연결 점검을 요청해 주세요.',true); });
-  }catch(e){ fbReady=false;centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요');showBootMessage('공유 저장소를 확인하고 있습니다. 관리자에게 연결 점검을 요청해 주세요.',true); }
+    }).catch((e)=>{ fbReady=false;centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요'); });
+  }catch(e){ fbReady=false;centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요'); }
 }
 /* 조리장이 짠 식단을 검색·위험군·끌어오기 풀에 누적 (원본 3년치는 안 건드림) */
 function absorbPlan(){
@@ -1474,12 +1504,10 @@ function render(){
 function sunCell(date,meal){
   const its=(S.plan[date]&&S.plan[date][meal]&&S.plan[date][meal].items)||[];
   const txt=its.map(it=>stripBox(it.n)).join('\n');
-  const syncWait=(FB_ON&&!fbReady)?' disabled title="공유 저장 연결 중입니다. 잠시 후 입력하세요"':'';
   return '<div class="cell sunbox-cell"><textarea class="sunta" placeholder="도시락 적기&#10;(한 줄에 하나)" '
-    +'oninput="sunEdit(this,\''+date+'\',\''+meal+'\')"'+syncWait+'>'+esc(txt)+'</textarea></div>';
+    +'oninput="sunEdit(this,\''+date+'\',\''+meal+'\')">'+esc(txt)+'</textarea></div>';
 }
 function sunEdit(ta,date,meal){
-  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 입력하세요',false);return}
   const lines=ta.value.split('\n').map(s=>s.trim()).filter(Boolean);
   S.plan[date]=S.plan[date]||{};
   S.plan[date][meal]={items:lines.map(n=>({n}))};
@@ -1513,13 +1541,11 @@ let algEditIdx=-1;   // 현재 알레르기 편집 중인 항목 index
 /* ===== 자리 바꾸기 (집고 놓기) ===== */
 let swapFrom=null;  // {date,meal}
 function pickSwap(date,meal){
-  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(swapFrom&&swapFrom.date===date&&swapFrom.meal===meal){swapFrom=null;render();return} // 같은 칸 다시 누르면 취소
   swapFrom={date,meal};render();
   toast(fmt(date)+' '+meal+' 을(를) 옮길 곳을 누르세요 (같은 '+meal+'끼리만)',false);
 }
 function cellClick(date,meal){
-  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(swapFrom){
     if(swapFrom.date===date&&swapFrom.meal===meal){swapFrom=null;render();return}
     if(swapFrom.meal!==meal){toast(meal+'은 '+swapFrom.meal+'끼리만 바꿀 수 있어요',false);return}
@@ -2284,7 +2310,6 @@ function undo(){if(!lastAct)return;S.plan[lastAct.date][lastAct.meal]=JSON.parse
 /* 기간 이동 / 다시 채우기 */
 function move(n){rememberViewStart(addDays(S.start,n*7));render()}
 function resetToRef(){
-  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return}
   if(!confirm('이 2주를 작년 같은 기간 식단으로 다시 채울까요? 지금 바꾼 내용은 사라집니다.'))return;
   periodDates(S.start).forEach(d=>{delete S.plan[d]});
   buildPeriod(S.start);save();render();
@@ -2320,7 +2345,6 @@ function restoreData(ev){
 }
 // 한 주(시작 월요일 ws)의 식단을 확정본으로 저장(덮어쓰기 = 수정)
 function confirmWeek(ws){
-  if(FB_ON&&!fbReady){toast('공유 저장 연결 중입니다. 잠시 후 다시 눌러주세요',false);return false}
   // 이미 확정된 주에서 다시 누르면 → 확정 표시만 해제(하양). 식단은 그대로 둠.
   if(S.confirmed[ws]){
     if(!confirm(fmt(ws)+'~ 주 확정을 해제할까요?\n식단은 그대로 두고, 확정본/엑셀 대상에서만 빠집니다.'))return false;
@@ -2461,7 +2485,8 @@ function openQuiz(){S.quizOpen=true;quizStep='slot';save();renderQuiz();
 /* 6/15 주 실제 식단은 누적 데이터(data3yr)에 들어있음 — 시작 주만 6/22로 두면 위에 직전 주(6/15)가 보임 */
 if(!S.start)rememberViewStart(monday('2026-06-22'));
 if(FB_ON){
-  initFirebase();   // 공유 모드에서는 Firebase 최신값을 먼저 받은 뒤 화면을 연다.
+  bootRender();
+  initFirebase();   // 화면은 먼저 열고, 공유 데이터가 오면 같은 자리에서 갱신한다.
 }else{
   fbReady=true;
   bootRender();
@@ -2476,6 +2501,7 @@ var ORD_RECIPE={}, ORD_ORDERED={}, ORD_CLEARED={}, ORD_QTY={}, ORD_PRICE={}, ORD
 var ORD_COST={people:630,mealPrice:630,targetRate:35};
 var ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:0,cost:0};
 var ORD_LAST=null, ordFbRef=null, ordReady=false, ordApplying=false, ordSaveTimer=null, ordLastLocalSave=0, ordPendingRemote=null;
+var ORD_DIRTY={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:false,cost:false};
 const ORD_PENDING_LS='ord_pending_shared';
 const ALLOW_EMPTY_REMOTE_ORDER_IMPORT=false; // 운영 중 빈 발주 Firebase에 오래된 로컬 발주를 자동 업로드하지 않음
 function ordMarkPendingShared(){try{localStorage.setItem(ORD_PENDING_LS,JSON.stringify({at:Date.now()}))}catch(e){}}
@@ -2502,20 +2528,23 @@ function ordResetStateForEmptyRemote(){
   ORD_VENDORS=ordDefaultVendors();ORD_COST=ordDefaultCost();
   ORD_TS={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:0,cost:0};
   ORD_LAST=ordSnapshotData();
+  ordDirtyReset();
   ordWriteLocal();ordClearPendingShared();
 }
 function ordNormTs(){ORD_TS=ORD_TS||{};ordMapKinds().forEach(function(k){ORD_TS[k]=ORD_TS[k]||{};});ORD_TS.vendors=ORD_TS.vendors||0;ORD_TS.cost=ORD_TS.cost||0;}
+function ordDirtyReset(){ORD_DIRTY={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:false,cost:false};}
+function ordDirtyAny(){return !!(ORD_DIRTY.vendors||ORD_DIRTY.cost||ordMapKinds().some(function(k){return Object.keys(ORD_DIRTY[k]||{}).length;}));}
 function ordSnapshotData(){ordCleanRecipeStockFlags();return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),price:ordClone(ORD_PRICE),learn:ordClone(ORD_LEARN),stock:ordClone(ORD_STOCK),hidden:ordClone(ORD_HIDDEN),vendors:ordClone(ORD_VENDORS),cost:ordClone(ORD_COST)};}
 function ordSame(a,b){return JSON.stringify(a)==JSON.stringify(b);}
 function ordStampMap(kind,now,prev,at){
   var keys={};Object.keys(now||{}).forEach(function(k){keys[k]=1;});Object.keys(prev||{}).forEach(function(k){keys[k]=1;});
-  Object.keys(keys).forEach(function(k){if(!ordSame((now||{})[k],(prev||{})[k]))ORD_TS[kind][k]=at;});
+  Object.keys(keys).forEach(function(k){if(!ordSame((now||{})[k],(prev||{})[k])){ORD_TS[kind][k]=at;ORD_DIRTY[kind][k]=1;}});
 }
 function ordStampDiff(){
   ordNormTs();var now=ordSnapshotData(),prev=ORD_LAST||{recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:[]},at=nowStamp();
   ordMapKinds().forEach(function(k){ordStampMap(k,now[k],prev[k],at);});
-  if(!ordSame(now.vendors,prev.vendors))ORD_TS.vendors=at;
-  if(!ordSame(now.cost,prev.cost))ORD_TS.cost=at;
+  if(!ordSame(now.vendors,prev.vendors)){ORD_TS.vendors=at;ORD_DIRTY.vendors=true;}
+  if(!ordSame(now.cost,prev.cost)){ORD_TS.cost=at;ORD_DIRTY.cost=true;}
   ORD_LAST=ordClone(now);
 }
 function ordWriteLocal(){try{localStorage.setItem('ord_recipe',JSON.stringify(ORD_RECIPE));
@@ -2530,6 +2559,20 @@ function ordWriteLocal(){try{localStorage.setItem('ord_recipe',JSON.stringify(OR
     localStorage.setItem('ord_vendors',JSON.stringify(ORD_VENDORS));
     localStorage.setItem('ord_ts',JSON.stringify(ORD_TS));}catch(e){}}
 function ordSharedState(){ordNormTs();ordCleanRecipeStockFlags();return {recipe:ordClone(ORD_RECIPE),ordered:ordClone(ORD_ORDERED),cleared:ordClone(ORD_CLEARED),qty:ordClone(ORD_QTY),price:ordClone(ORD_PRICE),learn:ordClone(ORD_LEARN),stock:ordClone(ORD_STOCK),hidden:ordClone(ORD_HIDDEN),vendors:ordClone(ORD_VENDORS),cost:ordClone(ORD_COST),ts:ordClone(ORD_TS),updatedAt:Date.now()};}
+function ordDirtyState(){
+  ordNormTs();ordCleanRecipeStockFlags();
+  var out={recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:[],cost:{},ts:{recipe:{},ordered:{},cleared:{},qty:{},price:{},learn:{},stock:{},hidden:{},vendors:0,cost:0},updatedAt:Date.now()};
+  var src={recipe:ORD_RECIPE,ordered:ORD_ORDERED,cleared:ORD_CLEARED,qty:ORD_QTY,price:ORD_PRICE,learn:ORD_LEARN,stock:ORD_STOCK,hidden:ORD_HIDDEN};
+  ordMapKinds().forEach(function(kind){
+    Object.keys(ORD_DIRTY[kind]||{}).forEach(function(k){
+      if(Object.prototype.hasOwnProperty.call(src[kind]||{},k))out[kind][k]=ordClone(src[kind][k]);
+      out.ts[kind][k]=ORD_TS[kind][k]||nowStamp();
+    });
+  });
+  if(ORD_DIRTY.vendors){out.vendors=ordClone(ORD_VENDORS);out.ts.vendors=ORD_TS.vendors||nowStamp();}
+  if(ORD_DIRTY.cost){out.cost=ordClone(ORD_COST);out.ts.cost=ORD_TS.cost||nowStamp();}
+  return out;
+}
 function ordEncodeMapKeys(map){var out={};Object.keys(map||{}).forEach(function(k){out[fbEncodeKey(k)]=ordClone(map[k]);});return out;}
 function ordDecodeMapKeys(map){var out={};Object.keys(map||{}).forEach(function(k){out[fbDecodeKey(k)]=ordClone(map[k]);});return out;}
 function ordEncodeStateForFirebase(r){
@@ -2598,7 +2641,7 @@ function ordFlushSharedStateNow(){
     ordSaveInFlight=false;
     if(!ok)return false;
     if(ordSaveQueued){ordSaveQueued=false;setTimeout(function(){ordFlushSharedStateNow();},50);}
-    else if(!saveInFlight&&!saveQueued&&!appUpdatePending){ordClearPendingShared();ordWriteLocal();setSyncBadge(officialUrlWarning()?'warn':'ok',officialUrlWarning()?'공식 주소 아님':'공유 저장됨');}
+    else if(!saveInFlight&&!saveQueued&&!appUpdatePending){ordClearPendingShared();ordDirtyReset();ordWriteLocal();setSyncBadge(officialUrlWarning()?'warn':'ok',officialUrlWarning()?'공식 주소 아님':'공유 저장됨');}
     maybeReloadForUpdate();
     return true;
   });
@@ -2618,7 +2661,7 @@ function ordRemoteHasData(r){
     || (Array.isArray(r.vendors)&&r.vendors.length)
     || (r.cost&&Object.keys(r.cost).length);
 }
-function ordSave(){if(!centralGuardWrite('order'))return false;ordStampDiff();if(!FB_ON)ordWriteLocal();ordLastLocalSave=Date.now();if(FB_ON)ordMarkPendingShared();
+function ordSave(){ordStampDiff();ordWriteLocal();ordLastLocalSave=Date.now();if(FB_ON)ordMarkPendingShared();
   if(FB_ON&&ordReady&&ordFbRef&&!ordApplying)ordQueueSharedStateWrite();
   else if(FB_ON){ordSaveQueued=true;setSyncBadge('busy','공유 연결 중');}
 }
@@ -2797,14 +2840,17 @@ function ordInitFirebase(){
       var pendingLocal=ordHasPendingShared();
       ordApplying=true;
       if(hasRemote){
-        if(pendingLocal&&ordHasData())r=ordMergeLocalIntoRemote(r,ordSharedState());
+        if(pendingLocal&&(ordHasData()||ordDirtyAny())){
+          if(ordDirtyAny())r=ordMergeLocalIntoRemote(r,ordDirtyState());
+          else ordClearPendingShared();
+        }
         repaired=ordApplyRemoteAuthority(r);
       }
       else if(ordHasData()&&ALLOW_EMPTY_REMOTE_ORDER_IMPORT){ordMarkPendingShared();try{Promise.resolve(ordWriteSharedState()).catch(function(e){showSaveProblem(e);});}catch(e){showSaveProblem(e);}}
       else if(!hasRemote){ordResetStateForEmptyRemote();}
       ordApplying=false;ordReady=true;centralMarkReady('order');
       if(ordSaveQueued){ordSaveQueued=false;ordQueueSharedStateWrite();}
-      if(pendingLocal&&ordHasData()){setSyncBadge('busy','미동기화 발주 저장 중');ordQueueSharedStateWrite();}
+      if(pendingLocal&&ordDirtyAny()){setSyncBadge('busy','미동기화 발주 저장 중');ordQueueSharedStateWrite();}
       if(repaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
       ordFbRef.on('value',function(snap2){
         if(ordApplying)return;
@@ -2865,7 +2911,6 @@ function ordRenderBoard(){
   var days=ordWeekDays();
   var h='<div class="osub"><div class="owkh">'+fmt(days[0])+' ~ '+fmt(days[5])+'</div>'
        +'<button class="ovbtn" onclick="ordOpenVendor()">업체</button></div>';
-  if(FB_ON&&!ordReady)h+='<div class="warnsum on">발주 공유 저장소 권한 확인이 필요합니다. 권한이 풀릴 때까지 발주 수정창은 열리지 않습니다.</div>';
   h+=ordCostSummaryHtml();
   h+='<div class="grid"><div class="hd"></div>';
   days.forEach(function(d,i){h+='<div class="hd">'+fmt(d)+'('+DOW[i]+')</div>';});
@@ -3006,7 +3051,7 @@ function ordCommitActiveInput(){
   else if(field==='amt')ordSetAmt(mi,ii,ae.value);
 }
 function ordOpenModal(date,meal){if(!centralGuardWrite('order'))return;ordModal={date:date,meal:meal};ordRenderModal();document.getElementById('oov').classList.add('on');}
-function ordCloseModal(){if(centralReadyForWrite('order')){ordCommitActiveInput();ordTrim();ordSave();}document.getElementById('oov').classList.remove('on');ordModal=null;ordApplyPendingRemote();if(typeof applyPendingRemoteState==='function')applyPendingRemoteState();ordRenderBoard();}
+function ordCloseModal(){ordCommitActiveInput();ordTrim();ordSave();document.getElementById('oov').classList.remove('on');ordModal=null;ordApplyPendingRemote();if(typeof applyPendingRemoteState==='function')applyPendingRemoteState();ordRenderBoard();}
 function ordSortItems(raw){
   return mealOrderItems(raw||[]);
 }
