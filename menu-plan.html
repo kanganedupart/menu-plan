@@ -90,6 +90,7 @@ opacity:0;transition:opacity .12s;padding:0;display:flex;align-items:center;just
 .mn.bad{color:var(--warnred);font-weight:700}
 .it{font-size:13px;color:var(--ink);line-height:1.4;font-weight:400}
 .it.bad{color:var(--warnred);font-weight:600}
+.soup-dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--g);margin-left:6px;vertical-align:.12em}
 .tag{font-size:9.5px;font-weight:700;color:#fff;border-radius:5px;padding:1px 5px;margin-left:3px;flex:none}
 .t매움{background:var(--red)}.t간장{background:var(--amber)}.t기름{background:var(--purple)}.t담백{background:var(--g)}
 .dot.t매움{background:var(--red)}.dot.t간장{background:var(--amber)}.dot.t기름{background:var(--purple)}.dot.t담백{background:var(--g)}
@@ -1527,8 +1528,8 @@ function cellHtml(date,meal,badset){
   const names=items.map(it=>it.n);
   const fixMissingMain=!hasExplicitMain(names);
   const main=fixMissingMain?mealMainName(names):'';
-  mealOrderItems(items).forEach(it=>{const b=badset.has(it.n),sl=effectiveSlot(it.n,main,fixMissingMain),cls=sl==='메인'?'mn':'it';
-    h+='<div class="'+cls+(b?' bad':'')+'">'+esc(it.n)+'</div>'});
+  mealOrderItems(items).forEach(it=>{const b=badset.has(it.n),sl=effectiveSlot(it.n,main,fixMissingMain),cls=sl==='메인'?'mn':'it',dot=sl==='국'?'<span class="soup-dot" aria-hidden="true"></span>':'';
+    h+='<div class="'+cls+(b?' bad':'')+'">'+esc(it.n)+dot+'</div>'});
   return h+'</div>';
 }
 function tasteBadge(n){const sl=slotOf(n);if(sl!=='메인'&&sl!=='국'&&sl!=='반찬')return '';const t=tasteOf(n);if(!t)return '';return '<span class="tbadge t'+t+'">'+t+'</span>';}
