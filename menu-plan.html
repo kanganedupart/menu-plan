@@ -327,7 +327,7 @@ window.FIREBASE_CONFIG = {
 <span class="lab" id="perLabel"></span>
 <button onclick="move(1)" aria-label="다음 2주">▶</button>
 </div>
-<div class="otabwrap"><button id="otabFood" class="otab on" onclick="ordShow('food')">식단</button><button id="otabOrder" class="otab" onclick="ordShow('order')">발주</button></div>
+<div class="otabwrap"><button id="otabFood" class="otab on" onclick="ordShow('food')">식단</button><button id="otabOrder" class="otab" onclick="openOrderCostFromMenu()">발주</button></div>
 <span id="syncBadge" class="syncbadge busy" aria-hidden="true"></span>
 <span class="spacer"></span>
 <button class="btn ghost" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관</button>
@@ -491,6 +491,7 @@ function stateRepairMissingTs(st,baseAt){
   return changed;
 }
 function readViewStart(){try{return localStorage.getItem(VIEW_LS)||''}catch(e){return ''}}
+function readUrlStart(){try{const q=new URLSearchParams(location.search||''),v=q.get('start')||q.get('weekStart')||q.get('date')||'';if(/^\d{4}-\d{2}-\d{2}$/.test(v)){try{localStorage.setItem(VIEW_LS,v)}catch(e){}return v}}catch(e){}return ''}
 function rememberViewStart(v){S.start=v;try{localStorage.setItem(VIEW_LS,v)}catch(e){}}
 function markPendingShared(){try{localStorage.setItem(PENDING_LS,JSON.stringify({at:Date.now(),updatedAt:S.updatedAt||0}))}catch(e){}}
 function clearPendingShared(){try{localStorage.removeItem(PENDING_LS)}catch(e){}}
@@ -851,7 +852,7 @@ function applyPendingRemoteState(){
   if(typeof render==='function'){buildPeriod(S.start);render()}
 }
 normalizeState();
-S.start=readViewStart()||null;        // 예전 공유 start 값은 믿지 않고, 이 기기의 보기 위치만 사용
+S.start=readUrlStart()||readViewStart()||null;        // 예전 공유 start 값은 믿지 않고, 이 기기의 보기 위치만 사용
 // 로직 버전이 바뀌어도 사용자가 짠 식단은 절대 비우지 않는다 (확정·작성 중인 것 보존).
 // 버전은 기록만 갱신. 빈 칸은 buildPeriod가 알아서 채우고, 이미 있는 칸은 그대로 둔다.
 if(S.planLogicVer!==PLAN_LOGIC_VER){
@@ -2344,15 +2345,16 @@ function restoreData(ev){
   rd.readAsText(f);
   ev.target.value='';
 }
-// 한 주(시작 월요일 ws)의 식단을 확정본으로 저장(덮어쓰기 = 수정)
+// 한 주(시작 월요일 ws)의 식단을 확정/해제
 function confirmWeek(ws){
-  // 이미 확정된 주에서 다시 누르면 → 확정 표시만 해제(하양). 식단은 그대로 둠.
   if(S.confirmed[ws]){
-    if(!confirm(fmt(ws)+'~ 주 확정을 해제할까요?\n식단은 그대로 두고, 확정본/엑셀 대상에서만 빠집니다.'))return false;
     delete S.confirmed[ws];
+    stateEnsureShape(S);
+    S._ts.confirmed[ws]=nowStamp();
+    dirtyMark('confirmed',ws);
     save();render();
-    toast(fmt(ws)+'~ 주 확정을 풀었어요 (식단은 그대로)',false);
-    return true;
+    toast(fmt(ws)+'~ 주 식단 확정을 해제했어요',false);
+    return false;
   }
   const wd=[];for(let i=0;i<6;i++)wd.push(addDays(ws,i));
   const sun=addDays(ws,6);   // 일요일 도시락도 함께
@@ -2364,13 +2366,15 @@ function confirmWeek(ws){
   const data={};
   [...wd,sun].forEach(d=>{data[d]={};['조식','점심','저녁'].forEach(meal=>{
     const its=((S.plan[d]&&S.plan[d][meal]&&S.plan[d][meal].items)||[]);
-    if(its.length)data[d][meal]=mealOrderItems(its).map(it=>it.n);
+      if(its.length)data[d][meal]=mealOrderItems(its).map(it=>it.n);
   })});
-  const existed=!!S.confirmed[ws];
   S.confirmed[ws]={start:ws,dates:wd,sun,data,at:Date.now()};
+  stateEnsureShape(S);
+  S._ts.confirmed[ws]=nowStamp();
+  dirtyMark('confirmed',ws);
   // 확정하면 누적 풀에도 반영
   absorbPlan();save();render();
-  toast(fmt(ws)+'~ 주 식단을 '+(existed?'다시 확정(수정)':'확정')+'했어요',false);
+  toast(fmt(ws)+'~ 주 식단을 확정했어요',false);
   return true;
 }
 // 현재 보는 2주 각각 확정
@@ -2391,7 +2395,8 @@ function downloadConfirmed(){
     const sun=c.sun||addDays(ws,6);
     const cols=[...wd,sun];   // 월~토 + 일
     const aoa=[['', ...wd.map((d,i)=>fmt(d)+' ('+DOW[i]+')'), fmt(sun)+' (일)']];
-    ['조식','점심','저녁'].forEach(meal=>{
+    const mealOrder=['조식','점심','저녁'];
+    mealOrder.forEach(meal=>{
       const any=cols.some(d=>(c.data[d]&&c.data[d][meal]&&c.data[d][meal].length));
       if(meal!=='조식'||any){
         aoa.push([meal, ...cols.map(d=>{
@@ -3162,6 +3167,18 @@ function ordDel(mi,ii){if(!centralGuardWrite('order'))return;var it=ordItems()[m
 function ordToggleOrder(){if(!centralGuardWrite('order'))return;if(!ordModal)return;var k=ordModal.date+'|'+ordModal.meal;ORD_ORDERED[k]=!ORD_ORDERED[k];ordSave();ordToast(ORD_ORDERED[k]?'완료':'해제');ordRenderModal();}
 
 /* ===== 탭/뷰 전환 (식단 화면은 그대로 두고 보이기/숨기기만) ===== */
+function orderCostOpenUrl(){
+  var start=S&&S.start?S.start:(readUrlStart()||readViewStart()||'');
+  if(!start&&typeof iso==='function')start=iso(new Date());
+  var end=(typeof addDays==='function'&&start)?addDays(start,5):start;
+  var q='?start='+encodeURIComponent(start)+'&weekStart='+encodeURIComponent(start)+'&weekEnd='+encodeURIComponent(end)+'&date='+encodeURIComponent(start);
+  if(location.protocol!=='file:')return 'order-cost.html'+q;
+  var p=decodeURIComponent(location.pathname||'').replace(/\\/g,'/');
+  return (p.indexOf('/식단/')>=0?'../발주단가.html':'발주단가.html')+q;
+}
+function openOrderCostFromMenu(){var url=orderCostOpenUrl(),w=null;try{w=window.open(url,'_blank')}catch(e){}if(!w)location.href=url;}
+window.openOrderCostFromMenu=openOrderCostFromMenu;
+window.orderCostOpenUrl=orderCostOpenUrl;
 function ordShow(view){
   var f=document.getElementById('otabFood'),o=document.getElementById('otabOrder');
   var weeks=document.getElementById('weeks'),ov=document.getElementById('orderview'),qc=document.getElementById('quizcard');
