@@ -36,7 +36,7 @@ font-size:14px;font-weight:700;cursor:pointer;color:var(--ink);font-family:inher
 .syncbadge{display:none;align-items:center;font-size:12px;font-weight:700;color:var(--mut);background:#F4F7F5;border:1px solid var(--line);
 border-radius:999px;padding:6px 10px;white-space:nowrap}
 .syncbadge.ok{color:var(--gd);background:var(--gbg);border-color:#BFD8CD}
-.syncbadge.busy,.syncbadge.warn,.syncbadge.bad{display:inline-flex}.syncbadge.busy{color:#7A642B;background:#FFF8E8;border-color:#EBD9A9}
+.syncbadge.busy{color:#7A642B;background:#FFF8E8;border-color:#EBD9A9}
 .syncbadge.bad{color:var(--red);background:var(--redbg);border-color:#E9C4BC}
 .syncbadge.warn{color:#8A5A13;background:#FFF6E6;border-color:#E9C98B}
 .centralgate{display:none!important}
@@ -328,7 +328,7 @@ window.FIREBASE_CONFIG = {
 <button onclick="move(1)" aria-label="다음 2주">▶</button>
 </div>
 <div class="otabwrap"><button id="otabFood" class="otab on" onclick="if(window.bareunIntegratedOrderShow)window.bareunIntegratedOrderShow('food');else window.__bareunPendingView='food'">식단</button><button id="otabOrder" class="otab" onclick="if(window.bareunIntegratedOrderShow)window.bareunIntegratedOrderShow('order');else window.__bareunPendingView='order'">발주</button><button id="otabAgg" class="otab" onclick="if(window.bareunIntegratedOrderShow)window.bareunIntegratedOrderShow('agg');else window.__bareunPendingView='agg'">집계</button></div>
-<span id="syncBadge" class="syncbadge busy" role="status" aria-live="polite"></span>
+
 <span class="spacer"></span>
 <button class="btn ghost food-tool" id="stockBtn" onclick="openStock()" title="자주 쓸 한 상을 미리 만들어 보관">보관</button>
 <button class="btn ghost food-tool" onclick="openGuide()" title="이 프로그램이 어떻게 작동하는지 설명">기준</button>
@@ -1031,15 +1031,7 @@ function setSyncBadge(kind,msg){
   syncState=kind||syncState;
   const el=document.getElementById('syncBadge');
   if(!el)return;
-  el.className='syncbadge '+(kind||'');
-  el.dataset.state=kind||'';
-  el.title=msg||'';
-  el.textContent=msg||(
-    kind==='ok'?'공유 저장됨':
-    kind==='busy'?'공유 저장 중':
-    kind==='bad'?'관리자 확인 필요':
-    kind==='warn'?'공유 확인 필요':''
-  );
+  el.className='syncbadge';el.dataset.state='';el.removeAttribute('title');el.textContent='';
 }
 function describeSaveError(e){
   const raw=String((e&&(e.message||e.code))||e||'알 수 없는 오류');
