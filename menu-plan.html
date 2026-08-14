@@ -3600,8 +3600,9 @@ body.bareun-order-mode .food-tool{display:none!important}
   function mealItems(date,meal){return (((S.plan||{})[date]||{})[meal]||{}).items||[]}
   function legacyMealComboKey(date,meal){return comboKey(mealItems(date,meal),meal)}
   function mealComboKey(date,meal){return legacyMealComboKey(date,meal)+'__'+String(date||'')}
+  function canonicalMealId(v){return {조식:'breakfast',점심:'lunch',저녁:'dinner',breakfast:'breakfast',lunch:'lunch',dinner:'dinner'}[String(v||'')]||String(v||'')}
   function mealNoteValues(bucket){return Array.isArray(bucket)?bucket.slice():Object.keys(bucket||{}).map(function(id){return Object.assign({id:id},bucket[id]||{})})}
-  function mealNotes(date,meal){var mealId={조식:'breakfast',점심:'lunch',저녁:'dinner'}[meal]||meal,dated=mealNoteValues(S.mealNotes&&S.mealNotes[mealComboKey(date,meal)]),legacy=mealNoteValues(S.mealNotes&&S.mealNotes[legacyMealComboKey(date,meal)]).filter(function(n){return String(n&&n.date||'')===String(date||'')&&(!n.mealId||String(n.mealId)===String(mealId))});return dated.filter(function(n){return String(n&&n.date||'')===String(date||'')&&(!n.mealId||String(n.mealId)===String(mealId))}).concat(legacy).sort(function(a,b){return Number(b.at||0)-Number(a.at||0)})}
+  function mealNotes(date,meal){var mealId=canonicalMealId(meal),dated=mealNoteValues(S.mealNotes&&S.mealNotes[mealComboKey(date,meal)]),legacy=mealNoteValues(S.mealNotes&&S.mealNotes[legacyMealComboKey(date,meal)]).filter(function(n){return String(n&&n.date||'')===String(date||'')&&(!n.mealId||canonicalMealId(n.mealId)===mealId)});return dated.filter(function(n){return String(n&&n.date||'')===String(date||'')&&(!n.mealId||canonicalMealId(n.mealId)===mealId)}).concat(legacy).sort(function(a,b){return Number(b.at||0)-Number(a.at||0)})}
   function mealIsExcludedItems(items,meal){return !!(S.excludedMeals&&S.excludedMeals[comboKey(items,meal)])}
   function mealIsExcluded(date,meal){return mealIsExcludedItems(mealItems(date,meal),meal)}
   function orderStateRead(){try{return JSON.parse(localStorage.getItem('bareun_order_cost_v2')||'{}')}catch(e){return {}}}
@@ -4145,8 +4146,9 @@ body.bareun-settings-mode .topin .food-tool{display:none!important}
   var unionCache={revision:'',value:[]},memoIndex={};
   function norm(v){return String(v||'').normalize('NFKC').replace(/\s+/g,'').toLowerCase()}
   function confirmedDate(date){var confirmed=S&&S.confirmed||{},keys=Object.keys(confirmed);for(var i=0;i<keys.length;i++){var record=confirmed[keys[i]]||{};if(record.data&&Object.prototype.hasOwnProperty.call(record.data,date))return true;if(Array.isArray(record.dates)&&record.dates.indexOf(date)>=0)return true;if(String(record.sun||'')===String(date))return true}return false}
-  function buildMemoIndex(raw){var state={},next={};try{state=JSON.parse(raw||'{}')}catch(e){}Object.keys(state.menuMemos||{}).forEach(function(id){var n=state.menuMemos[id]||{};if(String(n.text||'').trim())next[String(n.date||'')+'|'+String(n.mealId||'')+'|'+norm(n.menu)]=1});return next}
-  function hasExactMenuMemo(date,meal,name){var map={조식:'breakfast',점심:'lunch',저녁:'dinner'},mealId=map[meal]||meal;return !!memoIndex[String(date)+'|'+String(mealId)+'|'+norm(name)]}
+  function mealIdOf(v){return {조식:'breakfast',점심:'lunch',저녁:'dinner',breakfast:'breakfast',lunch:'lunch',dinner:'dinner'}[String(v||'')]||String(v||'')}
+  function buildMemoIndex(raw){var state={},next={};try{state=JSON.parse(raw||'{}')}catch(e){}Object.keys(state.menuMemos||{}).forEach(function(id){var n=state.menuMemos[id]||{};if(String(n.text||'').trim())next[String(n.date||'')+'|'+mealIdOf(n.mealId)+'|'+norm(n.menu)]=1});return next}
+  function hasExactMenuMemo(date,meal,name){return !!memoIndex[String(date)+'|'+mealIdOf(meal)+'|'+norm(name)]}
   window.bareunHistoricalMeals=function(){
     var orderRaw='';try{orderRaw=localStorage.getItem('bareun_order_cost_v2')||''}catch(e){}var revision=String(S&&S.updatedAt||0)+'|'+orderRaw;if(unionCache.revision===revision)return unionCache.value;
     memoIndex=buildMemoIndex(orderRaw);
