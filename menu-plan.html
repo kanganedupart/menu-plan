@@ -4139,5 +4139,24 @@ body.bareun-settings-mode .topin .food-tool{display:none!important}
  save();setTimeout(render,0);
 })();
 </script>
+<script id="bareun-menu-occurrence-union-patch">
+(function(){
+  var base=window.bareunHistoricalMeals;
+  var unionCache={revision:'',value:[]},memoIndex={};
+  function norm(v){return String(v||'').normalize('NFKC').replace(/\s+/g,'').toLowerCase()}
+  function confirmedDate(date){var confirmed=S&&S.confirmed||{},keys=Object.keys(confirmed);for(var i=0;i<keys.length;i++){var record=confirmed[keys[i]]||{};if(record.data&&Object.prototype.hasOwnProperty.call(record.data,date))return true;if(Array.isArray(record.dates)&&record.dates.indexOf(date)>=0)return true;if(String(record.sun||'')===String(date))return true}return false}
+  function buildMemoIndex(raw){var state={},next={};try{state=JSON.parse(raw||'{}')}catch(e){}Object.keys(state.menuMemos||{}).forEach(function(id){var n=state.menuMemos[id]||{};if(String(n.text||'').trim())next[String(n.date||'')+'|'+String(n.mealId||'')+'|'+norm(n.menu)]=1});return next}
+  function hasExactMenuMemo(date,meal,name){var map={조식:'breakfast',점심:'lunch',저녁:'dinner'},mealId=map[meal]||meal;return !!memoIndex[String(date)+'|'+String(mealId)+'|'+norm(name)]}
+  window.bareunHistoricalMeals=function(){
+    var orderRaw='';try{orderRaw=localStorage.getItem('bareun_order_cost_v2')||''}catch(e){}var revision=String(S&&S.updatedAt||0)+'|'+orderRaw;if(unionCache.revision===revision)return unionCache.value;
+    memoIndex=buildMemoIndex(orderRaw);
+    var groups={},out=[];
+    function add(date,meal,items){date=String(date||'');meal=String(meal||'');items=(items||[]).filter(function(x){return String(x&&x.n!==undefined?x.n:x).trim()});if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!meal||!items.length)return;var key=date+'|'+meal,g=groups[key]||(groups[key]={key:key,date:date,meal:meal,items:[],seen:{}});items.forEach(function(x){var name=String(x&&x.n!==undefined?x.n:x).trim(),n=norm(name);if(name&&!g.seen[n]){g.seen[n]=1;g.items.push(name)}})}
+    (base?base():[]).forEach(function(r){add(r.date,r.meal,r.items)});
+    Object.keys(S&&S.plan||{}).forEach(function(date){Object.keys(S.plan[date]||{}).forEach(function(meal){var items=((S.plan[date][meal]||{}).items||[]);if(!confirmedDate(date))items=items.filter(function(x){return hasExactMenuMemo(date,meal,x&&x.n!==undefined?x.n:x)});add(date,meal,items)})});
+    Object.keys(groups).forEach(function(k){delete groups[k].seen;out.push(groups[k])});out.sort(function(a,b){return String(b.date).localeCompare(String(a.date))||String(a.meal).localeCompare(String(b.meal),'ko')});unionCache={revision:revision,value:out};return out;
+  };
+})();
+</script>
 </body>
 </html>
