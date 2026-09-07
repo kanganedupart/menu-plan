@@ -441,7 +441,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260627_1208_order_empty_dirty_delta'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260907_1556_food_edit_unconfirms'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -840,12 +840,54 @@ function statePlanKeys(plan){
 }
 function stateSnapshot(){return stripTransientState({plan:stateClone(S.plan),confirmed:stateClone(S.confirmed),fix:stateClone(S.fix),cleared:stateClone(S.cleared),lunchboxDates:stateClone(S.lunchboxDates),mealEvents:stateClone(S.mealEvents),saved:stateClone(S.saved),skip:stateClone(S.skip),_ts:stateClone(S._ts)});}
 function stateSame(a,b){return JSON.stringify(a)==JSON.stringify(b);}
+function confirmedWeekHasDate(rec,date){
+  if(!rec||!date)return false;
+  return !!((rec.data&&Object.prototype.hasOwnProperty.call(rec.data,date))
+    ||(Array.isArray(rec.dates)&&rec.dates.includes(date))
+    ||String(rec.sun||'')===String(date));
+}
+function confirmedWeekHasMenu(rec,name){
+  if(!rec||!rec.data||!name)return false;
+  return Object.keys(rec.data).some(date=>Object.keys(rec.data[date]||{}).some(meal=>{
+    const raw=rec.data[date][meal]||[];
+    const list=Array.isArray(raw)?raw:(raw&&Array.isArray(raw.items)?raw.items:[]);
+    return list.some(item=>String(typeof item==='string'?item:(item&&item.n)||'')===String(name));
+  }));
+}
+function resetConfirmedAfterFoodEdit(prev){
+  if(!prev||!S.confirmed)return;
+  const dates={},menus={};
+  const planKeys={};Object.assign(planKeys,statePlanKeys(S.plan),statePlanKeys(prev.plan));
+  Object.keys(planKeys).forEach(k=>{
+    const split=k.indexOf('|'),date=k.slice(0,split),meal=k.slice(split+1);
+    if(date==='__stock__')return;
+    if(!stateSame(((S.plan[date]||{})[meal]),((prev.plan[date]||{})[meal])))dates[date]=1;
+  });
+  const fixKeys={};Object.keys(S.fix||{}).forEach(k=>fixKeys[k]=1);Object.keys(prev.fix||{}).forEach(k=>fixKeys[k]=1);
+  const printedFix=v=>({slot:String((v||{}).slot||''),alg:String((v||{}).alg||'')});
+  Object.keys(fixKeys).forEach(name=>{if(!stateSame(printedFix((S.fix||{})[name]),printedFix((prev.fix||{})[name])))menus[name]=1;});
+  ['mealEvents','lunchboxDates'].forEach(kind=>{
+    const keys={};Object.keys(S[kind]||{}).forEach(k=>keys[k]=1);Object.keys(prev[kind]||{}).forEach(k=>keys[k]=1);
+    Object.keys(keys).forEach(k=>{if(!stateSame((S[kind]||{})[k],(prev[kind]||{})[k]))dates[String(k).split('|')[0]]=1;});
+  });
+  if(!Object.keys(dates).length&&!Object.keys(menus).length)return;
+  const at=nowStamp();
+  Object.keys(S.confirmed).forEach(ws=>{
+    const rec=S.confirmed[ws];
+    const affected=Object.keys(dates).some(date=>confirmedWeekHasDate(rec,date))
+      ||Object.keys(menus).some(name=>confirmedWeekHasMenu(rec,name));
+    if(!affected)return;
+    delete S.confirmed[ws];
+    S._ts.confirmed[ws]=at;
+    dirtyMark('confirmed',ws);
+  });
+}
 function stateMapDiff(kind,now,prev,at){
   const keys={};Object.keys(now||{}).forEach(k=>keys[k]=1);Object.keys(prev||{}).forEach(k=>keys[k]=1);
   Object.keys(keys).forEach(k=>{if(!stateSame((now||{})[k],(prev||{})[k]))S._ts[kind][k]=at;});
 }
 function stateStampDiff(){
-  normalizeState();const now=stateSnapshot(),prev=STATE_LAST||{plan:{},confirmed:{},fix:{},cleared:{},lunchboxDates:{},mealEvents:{},saved:[],skip:[]},at=nowStamp();
+  normalizeState();const prev=STATE_LAST||{plan:{},confirmed:{},fix:{},cleared:{},lunchboxDates:{},mealEvents:{},saved:[],skip:[]};resetConfirmedAfterFoodEdit(prev);const now=stateSnapshot(),at=nowStamp();
   const pk=statePlanKeys(now.plan),ppk=statePlanKeys(prev.plan),keys={};Object.assign(keys,pk,ppk);
   Object.keys(keys).forEach(k=>{
     const [d,m]=k.split('|');
