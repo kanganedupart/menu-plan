@@ -1,0 +1,54 @@
+import {createMobileUploadStore} from './mobile-upload-store.js';
+export function mount(container,transport){
+ const session=new Set(),records=new Map(),cards=new Map(),remoteCards=new Map(),urls=new Map();let disposed=false,unsub=()=>{},timer;
+ const el=(tag,text,cls)=>{const e=document.createElement(tag);if(text!==undefined)e.textContent=text;if(cls)e.className=cls;return e};
+ const root=el('section',undefined,'br-receipts'),heading=el('h2','영수증'),notice=el('p',transport?'사진을 올리면 내용을 읽어 표시합니다.':'연결되지 않았습니다. 사진은 이 기기에 보관합니다.','br-notice');
+ root.append(heading,notice);const pickers=el('div',undefined,'br-pickers');
+ const recent=el('div',undefined,'br-list'),past=el('details'),pastList=el('div',undefined,'br-list');past.append(el('summary','이전 업로드'),pastList);
+ for(const[capture,label]of[[true,'사진 촬영'],[false,'사진 선택']]){const l=el('label',label,'br-picker'),input=el('input');input.type='file';input.accept='image/*';if(capture)input.setAttribute('capture','environment');else input.multiple=true;input.addEventListener('change',async()=>{for(const file of input.files){const id=crypto.randomUUID();session.add(id);const immediate={eventId:id,fileName:file.name,blob:file,state:'saving'};draw(immediate);try{const saved=await store.add(file,{eventId:id,fileName:file.name});draw(saved);void drain()}catch(e){cards.get(id).status.textContent='기기 보관 실패 · 원본 사진을 유지해 주세요.'}}input.value=''});l.append(input);pickers.append(l)}
+ const pending=el('div',undefined,'br-list br-pending');root.append(pickers,el('h3','이번 업로드'),recent,el('h3','확인 대기'),pending,past);container.append(root);
+ const store=createMobileUploadStore({name:'bareun_receipt_panel_v1',adapter:transport?{
+  upload:async r=>{const result=await transport.upload({bytes:await r.blob.arrayBuffer(),mime:r.mimeType,name:r.fileName,sha:r.sha256,eventId:r.eventId});if(!result?.id||!Number.isInteger(result.revision))throw Error('invalid_receipt_response');if(!records.has(result.id)||result.revision>=records.get(result.id).revision)records.set(result.id,result);return {...result,eventId:r.eventId,sha256:r.sha256}},
+  cancel:async r=>{const local=await store.get(r.eventId),record=records.get(local?.receipt?.id)||local?.receipt;if(!record?.id)throw Error('receipt_identity_unconfirmed');const result=await transport.cancel({id:record.id,revision:record.revision});if(!result?.cancelled)throw Error('cancel_unconfirmed');records.set(record.id,result);return {eventId:r.eventId,cancelled:true}}
+ }:undefined});
+ const isCancelled=r=>r?.cancelled===true||r?.status==='cancelled';
+ const balanced=(r,amount=Number(r?.amount))=>Number.isFinite(amount)&&((r?.documentType==='total-only'&&!!r.totalEvidence)||(r?.items?.length&&r.items.every(x=>Number.isFinite(Number(x.amount)))&&Number.isFinite(Number(r.discount??0))&&Number.isFinite(Number(r.tax??0))&&Math.abs(r.items.reduce((s,x)=>s+Number(x.amount),0)-Number(r.discount??0)+Number(r.tax??0)-amount)<0.001));
+ const errorText=message=>({not_a_receipt:'영수증 사진인지 확인해 주세요.',receipt_sum_mismatch:'품목 합계와 총액이 맞지 않습니다.',multiple_manual_totals_need_matching:'기존 수동 금액 중 연결할 대상을 확인해 주세요.',revision_conflict:'다른 변경이 있어 최신 내용을 확인해야 합니다.'}[message]||(/[가-힣]/.test(message||'')?message:'연결 또는 입력 내용을 확인해 주세요.'));
+ const completedText=r=>r.gm?.excluded?'식비 반영 완료 · 총무 제외 업체'+(r.gm.reason?' · '+r.gm.reason:''):'처리 완료';
+ const issueText=r=>r?.status==='reading'?'사진 내용을 읽고 있습니다.':r?.error||r?.status==='read_error'?'사진을 읽지 못했습니다. 재판독을 확인 중입니다.':r?.issues?.length?'사진에서 분명하지 않은 내용이 있습니다. 날짜·업체·총액을 확인해 주세요.':'';
+ function draw(row){if(disposed)return;let card=cards.get(row.eventId);if(!card){const box=el('article',undefined,'br-card'),image=el('img'),title=el('strong',row.fileName),status=el('p','사진 보관 중','br-status'),form=el('form'),fields={};const url=URL.createObjectURL(row.blob);urls.set(row.eventId,url);image.src=url;image.alt='영수증 원본 사진';const link=el('a');link.href=url;link.target='_blank';link.rel='noopener';link.append(image);box.append(title,link,status);
+   for(const[key,label,type]of[['date','날짜','date'],['vendor','업체','text'],['amount','총액','text']]){const l=el('label',label),input=el('input');input.type=type;if(key==='amount')input.inputMode='decimal';input.name=key;fields[key]=input;l.append(input);form.append(l)}
+   const save=el('button','수정 내용 확인'),cancel=el('button','취소');save.type='submit';cancel.type='button';form.append(save,cancel);box.append(form);card={box,status,form,fields,save,cancel,dirty:false,busy:false,row};cards.set(row.eventId,card);
+   Object.values(fields).forEach(input=>input.addEventListener('input',()=>{if(!card.dirty)card.editRevision=(records.get(card.row.receipt?.id)||card.row.receipt)?.revision;card.dirty=true;card.editVersion=(card.editVersion||0)+1;status.textContent='수정 중 · 아직 반영되지 않았습니다.';void store.saveDraft(row.eventId,{date:fields.date.value,vendor:fields.vendor.value,amount:fields.amount.value,revision:card.editRevision}).catch(()=>{status.textContent='입력 보관을 확인하지 못했습니다. 이 화면을 유지해 주세요.'})}));
+   form.addEventListener('submit',async e=>{e.preventDefault();const r=records.get(card.row.receipt?.id)||card.row.receipt;if(!transport||!r?.id||card.busy||card.row.receipt?.duplicate||isCancelled(r))return;if(card.dirty&&card.editRevision!==undefined&&card.editRevision!==r.revision){status.textContent='다른 변경이 있습니다. 입력은 유지하며 연결 대상을 다시 확인해 주세요.';return}const amount=Number(fields.amount.value.replace(/,/g,'')),items=r.items||[];if(!fields.date.value||!fields.vendor.value.trim()||fields.amount.value.trim()===''||!Number.isFinite(amount)){status.textContent='날짜·업체·총액을 확인해 주세요.';return}if(!balanced(r,amount)){status.textContent='품목 합계와 총액을 확인해 주세요. 수정 내용은 반영하지 않았습니다.';return}card.busy=true;save.disabled=true;const sentVersion=card.editVersion||0;try{const result=await transport.confirm({id:r.id,revision:r.revision,date:fields.date.value,vendor:fields.vendor.value.trim(),amount,items,documentType:r.documentType,totalEvidence:r.totalEvidence,discount:r.discount,tax:r.tax,time:r.time,manualTotalIds:r.manualTotalIds});if(!result?.id||result.error||result.conflict||result.waiting)throw Error(result.error?errorText(result.error):result.waiting==='duplicate_decision_required'?'이미 등록된 사진인지 확인이 필요합니다.':result.conflict?'기존 금액과 연결할 대상을 확인해 주세요.':'연결 또는 판독 내용을 확인해 주세요.');records.set(result.id,result);if((card.editVersion||0)===sentVersion){card.dirty=false;await store.saveDraft(row.eventId,null);card.row.draft=null}else{card.editRevision=result.revision}draw(card.row)}catch(e){status.textContent='반영을 확인하지 못했습니다. '+errorText(e.message)+' 입력을 유지합니다.'}finally{card.busy=false;save.disabled=!transport||!r?.id||card.row.receipt?.duplicate===true||isCancelled(r)}});
+   cancel.addEventListener('click',async()=>{if(card.busy)return;card.busy=true;try{if(card.row.receipt?.duplicate)await store.dismissDuplicate(row.eventId);else await store.cancel(row.eventId);await refresh();void drain()}catch(e){status.textContent='취소를 확인하지 못했습니다.'}finally{card.busy=false}});
+  }
+  card.row=row;(session.has(row.eventId)?recent:pastList).prepend(card.box);const r=records.get(row.receipt?.id)||row.receipt;card.box.hidden=row.state==='cancelled'||isCancelled(r);
+  if(!card.dirty&&row.draft){card.dirty=true;card.editRevision=row.draft.revision;for(const k of ['date','vendor','amount'])card.fields[k].value=row.draft[k]??''}if(!card.dirty&&r){for(const k of ['date','vendor','amount'])card.fields[k].value=r[k]??''}
+  card.save.disabled=!transport||!r?.id||card.busy||row.receipt?.duplicate===true||(!r.items?.length&&!(r.documentType==='total-only'&&r.totalEvidence));card.cancel.textContent=row.receipt?.duplicate?'목록에서 닫기':'취소';
+  if(card.dirty)return;
+  card.status.textContent=row.receipt?.duplicate?'이미 등록된 영수증':row.state==='saving'?'기기에 사진 보관 중':row.state==='cancel-pending'?'취소 확인 중':!transport?'기기에 보관됨 · 연결 대기':!r?'사진 전송 대기':r.meal?.acked===true&&r.gm?.acked===true&&balanced(r)?completedText(r):issueText(r)||(r.items?.length||r.documentType==='total-only'?'내용 확인 · 반영 대기':'사진 접수됨 · 판독 대기');
+ }
+ async function refresh(){
+  if(disposed)return;
+  const rows=(await store.list()).sort((a,b)=>a.createdAt-b.createdAt),localIds=new Set(rows.filter(r=>!r.receipt?.duplicate).map(r=>r.receipt?.id));
+  for(const row of rows)draw(row);
+  for(const r of records.values()){
+   let card=remoteCards.get(r.id);
+   if(localIds.has(r.id)||isCancelled(r)){if(card)card.box.hidden=true;continue}
+   if(!card){const box=el('article',undefined,'br-card br-remote'),label=el('p'),status=el('p',undefined,'br-status'),button=el('button','사진 보기');button.type='button';box.append(label,status,button);card={box,label,status,button};remoteCards.set(r.id,card);pastList.prepend(box);
+    button.addEventListener('click',async()=>{if(card.loading)return;card.loading=true;button.disabled=true;try{
+     if(!transport?.getOriginal)throw Error('original_transport_missing');
+     const blob=await transport.getOriginal(r.id),latest=records.get(r.id);
+     if(disposed)return;if(isCancelled(latest)){await refresh();return}
+     const adopted=await store.adoptRemote(blob,latest);draw(adopted);await refresh();
+    }catch(e){status.textContent='원본 사진을 확인하지 못했습니다. 잠시 후 다시 열어 주세요.'}finally{card.loading=false;button.disabled=!transport?.getOriginal}});
+   }
+   (r.meal?.acked===true&&r.gm?.acked===true&&balanced(r)?pastList:pending).prepend(card.box);card.box.hidden=false;card.label.textContent=[r.date||'날짜 판독 중',r.vendor||'업체 판독 중',Number.isFinite(r.amount)?r.amount.toLocaleString('ko-KR')+'원':'금액 판독 중'].join(' · ');card.status.textContent=issueText(r)||(r.meal?.acked&&r.gm?.acked&&balanced(r)?completedText(r):'내용 확인 · 반영 대기');card.button.disabled=card.loading||!transport?.getOriginal;
+  }
+ }
+ async function drain(){clearTimeout(timer);if(disposed)return;try{if(transport)await store.retryPending();await refresh()}catch(e){notice.textContent='사진 보관 상태를 확인하지 못했습니다. 원본을 유지해 주세요.'}if(!disposed)timer=setTimeout(drain,5000)}
+ if(transport?.subscribe)unsub=transport.subscribe(update=>{for(const r of Array.isArray(update)?update:[update])if(r?.id){const old=records.get(r.id);if(!old||r.revision>=old.revision)records.set(r.id,r)}void refresh()})||(()=>{});
+ const online=()=>void drain();window.addEventListener('online',online);void drain();
+ return {refresh,destroy(){disposed=true;clearTimeout(timer);unsub();window.removeEventListener('online',online);for(const u of urls.values())URL.revokeObjectURL(u);void store.close();root.remove()}};
+}
