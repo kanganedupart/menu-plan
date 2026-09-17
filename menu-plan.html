@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260917_meal_delete_save_guard'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260917_verified_first_render'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -453,7 +453,7 @@ let LAST_STAMP=0;
 function nowStamp(){const n=Date.now()*1000+CLIENT_OFFSET;if(n<=LAST_STAMP)LAST_STAMP+=1;else LAST_STAMP=n;return LAST_STAMP;}
 // Firebase 설정 여부
 const FB_ON = !!(window.FIREBASE_CONFIG && window.FIREBASE_CONFIG.databaseURL);
-let fbRef=null, fbReady=false, fbApplying=false;
+let fbRef=null, fbReady=false, fbApplying=false, menuBootFailed=false;
 let pendingRemoteState=null;
 let appBooted=false, appUpdatePending=false, syncState='busy';
 let pendingRecoveryHold=false,pendingRecoveryReason='';
@@ -1362,8 +1362,8 @@ function initFirebase(){
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
       });
-    }).catch((e)=>{ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection'); });
-  }catch(e){ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection'); }
+    }).catch((e)=>{ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); });
+  }catch(e){ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); }
 }
 /* 조리장이 짠 식단을 검색·위험군·끌어오기 풀에 누적 (원본 3년치는 안 건드림) */
 function absorbPlan(){
@@ -1725,6 +1725,10 @@ function badItemSet(date,meal){
 /* ===== 렌더 ===== */
 function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){const n=(S.saved||[]).length;sb.textContent=n?('보관 '+n):'보관'}}
 function render(){
+  if(FB_ON&&!fbReady){
+    showBootMessage(menuBootFailed?'식단을 불러오지 못했습니다. 잠시 후 다시 접속해 주세요.':'저장된 식단을 불러오는 중입니다…',menuBootFailed);
+    return;
+  }
   if(!S.start)S.start=monday(iso(new Date()));
   const topStart=addDays(S.start,-7);          // 위 = 직전 주(참고)
   buildPeriod(topStart);absorbPlan();          // 화면 그리기는 저장하지 않는다
@@ -2750,8 +2754,8 @@ function openQuiz(){S.quizOpen=true;quizStep='slot';save();renderQuiz();
 /* 6/15 주 실제 식단은 누적 데이터(data3yr)에 들어있음 — 시작 주만 6/22로 두면 위에 직전 주(6/15)가 보임 */
 if(!S.start)rememberViewStart(monday(iso(new Date())));
 if(FB_ON){
-  bootRender();
-  initFirebase();   // 화면은 먼저 열고, 공유 데이터가 오면 같은 자리에서 갱신한다.
+  render();
+  initFirebase();   // 공유 자료 확인 전에는 임시 식단을 그리지 않는다.
 }else{
   fbReady=true;
   bootRender();
