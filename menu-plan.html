@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260907_1556_food_edit_unconfirms'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260917_meal_delete_save_guard'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -1060,11 +1060,20 @@ function centralGuardWrite(kind){
   if(centralReadyForWrite(kind))return true;
   return true;
 }
-function setSyncBadge(kind,msg){
- syncState=kind||syncState;let el=document.getElementById('syncBadge');if(!el&&(kind==='warn'||kind==='bad')){const header=document.querySelector('.topin');if(header){el=document.createElement('span');el.id='syncBadge';el.setAttribute('role','status');el.setAttribute('aria-live','polite');el.style.maxWidth='38vw';el.style.whiteSpace='normal';header.appendChild(el)}}if(!el)return;
- if(kind==='busy'&&el.dataset.state==='warn')return;
- if(kind==='ok'&&el.dataset.state==='warn'){let pending=false;try{pending=!!sharedInputCore&&sharedInputCore.hasPending()}catch(_){}if(pending)return;}
- const bad=kind==='warn'||kind==='bad';el.className='syncbadge'+(bad?' warn':'');el.style.display=bad?'inline-flex':'none';el.dataset.state=bad?'warn':'';el.textContent=bad?String(msg||'공유 저장 미확인'):'';if(bad)el.title=el.textContent;else el.removeAttribute('title');
+function setSyncBadge(kind,msg,scope,detail){
+ scope=scope||'menu';syncState=kind||syncState;
+ const issues=setSyncBadge.issues||(setSyncBadge.issues=Object.create(null));
+ if(kind==='warn'||kind==='bad')issues[scope]={message:String(msg||'공유 저장 미확인'),detail:detail||((issues[scope]||{}).detail)||''};
+ else if(kind==='ok'){
+   let pending=false;if(scope==='menu'){try{pending=!!sharedInputCore&&(sharedInputCore.hasPending()||!!sharedInputCore.failure())}catch(_){pending=true;}}
+   if(!pending)delete issues[scope];
+ }
+ const all=Object.keys(issues).map(key=>issues[key]),problem=all[0];
+ let el=document.getElementById('syncBadge');
+ if(!el&&problem){const header=document.querySelector('.topin');if(header){el=document.createElement('span');el.id='syncBadge';el.setAttribute('role','status');el.setAttribute('aria-live','polite');el.style.maxWidth='38vw';el.style.whiteSpace='normal';header.appendChild(el)}}
+ if(!el)return;
+ el.className='syncbadge'+(problem?' warn':'');el.style.display=problem?'inline-flex':'none';el.dataset.state=problem?'warn':'';el.textContent=problem?problem.message:'';
+ if(problem)el.title=all.map(x=>x.message+(x.detail?' — '+x.detail:'')).join('\n');else el.removeAttribute('title');
 }
 function describeSaveError(e){
   const raw=String((e&&(e.message||e.code))||e||'알 수 없는 오류');
@@ -1076,13 +1085,14 @@ function describeSaveError(e){
   if(/network|offline|fetch|disconnected|timeout/i.test(raw))return '인터넷 연결이 불안정해서 공유 저장이 지연되고 있습니다.';
   return raw.slice(0,240);
 }
-function showSaveProblem(e){
+function showSaveProblem(e,scope){
+  scope=scope||'menu';
   const msg=describeSaveError(e);
   const now=Date.now();
-  if(msg===lastSaveProblemText && now-lastSaveProblemAt<15000)return;
-  lastSaveProblemText=msg;lastSaveProblemAt=now;
+  if(scope+'|'+msg===lastSaveProblemText && now-lastSaveProblemAt<15000)return;
+  lastSaveProblemText=scope+'|'+msg;lastSaveProblemAt=now;
   centralGate.lastDetail=msg;
-  setSyncBadge('warn','공유 확인 필요');
+  setSyncBadge('warn','공유 확인 필요',scope,msg);
   if(window.console)console.warn('[shared-save]',msg);
 }
 function showBootMessage(msg,bad){
@@ -1099,14 +1109,14 @@ function bootRender(){
   render();renderQuiz();
   STATE_LAST=stateSnapshot();
   dirtyReset();
-  if(officialUrlWarning())setSyncBadge('warn','공식 주소 아님');
-  else if(FB_ON&&fbReady)setSyncBadge('ok','공유 저장됨');
+  if(officialUrlWarning())setSyncBadge('warn','공식 주소 아님','address');
+  if(FB_ON&&fbReady)setSyncBadge('ok','공유 연결됨','connection');
 }
 function maybeReloadForUpdate(){
   if(!appUpdatePending)return;
   if(sharedInputCore.hasPending())return;
   if(menuEditing()||saveInFlight||saveQueued)return;
-  setSyncBadge('warn','새 버전 적용 중');
+  setSyncBadge('warn','새 버전 적용 중','version');
   flushSharedStateNow().finally(()=>setTimeout(()=>location.reload(),250));
 }
 function checkAppVersion(){
@@ -1116,7 +1126,7 @@ function checkAppVersion(){
     const m=txt.match(/const APP_BUILD='([^']+)'/);
     if(m&&m[1]&&m[1]!==APP_BUILD){
       appUpdatePending=true;
-      setSyncBadge('warn','새 버전 있음');
+      setSyncBadge('warn','새 버전 있음','version');
       maybeReloadForUpdate();
     }
   }).catch(()=>{});
@@ -1194,6 +1204,12 @@ function createSharedJournalCore(options){
   if(inflight)return inflight;
   inflight=(async()=>{await prepare();await tail;if(failed)throw failed;
    while(records.length){const record=records[0];let conflict=null;
+    const durable=await journal.get(record.id);
+    if(!durable||durable.id!==record.id||durable.hash!==record.hash)throw error('SHARED_JOURNAL_MISMATCH');
+    if(durable.state==='acked'){records=records.filter(r=>r.id!==record.id);continue;}
+    if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
+    const proved=remoteAcks.get(record.id);
+    if(proved&&proved.id===record.id&&proved.hash===record.hash){await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
     const result=await options.transaction(current=>{try{return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
     if(conflict)throw conflict;if(!result||!result.committed)throw error('SHARED_NOT_COMMITTED');
     if(result.verifiedSnapshot){
@@ -1263,18 +1279,19 @@ async function sharedWaitForAck(result){
   let failure=null;try{await sharedInputCore.drain()}catch(e){failure=e;showSaveProblem(e);}
   if(result.empty){if(failure)throw failure;return {ok:false,unchanged:true};}
   const serverAck=sharedInputCore.remoteAck(result.id);
-  let acked;try{acked=await sharedInputJournal.get(result.id)}catch(e){if(serverAck)return Object.assign({ok:true,journalCleanupPending:true},serverAck);throw e;}
-  if(acked.state==='acked'&&acked.hash===result.hash)return Object.assign({ok:true},acked);
-  if(serverAck)return Object.assign({ok:true,journalCleanupPending:true},serverAck);
+  let acked;try{acked=await sharedInputJournal.get(result.id)}catch(e){if(serverAck)return finishSharedAck(Object.assign({ok:true,journalCleanupPending:true},serverAck));throw e;}
+  if(acked.state==='acked'&&acked.hash===result.hash)return finishSharedAck(Object.assign({ok:true},acked));
+  if(serverAck)return finishSharedAck(Object.assign({ok:true,journalCleanupPending:true},serverAck));
   throw failure||new Error('입력은 보관되었지만 공유 완료를 확인하지 못했습니다.');
  }catch(error){if(result.id){error.operationId=result.id;error.operationHash=result.hash;}throw error;}
 }
 window.bareunRetrySharedInput=async(id,hash)=>{
  const record=await sharedInputJournal.get(id);if(record.hash!==hash)throw new Error('다시 확인할 입력 원문이 다릅니다');
- if(record.state==='acked')return Object.assign({ok:true},record);
+ if(record.state==='acked')return finishSharedAck(Object.assign({ok:true},record));
  return sharedWaitForAck({id,hash});
 };
 
+function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');return result;}
 function flushSharedStateNow(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady))return Promise.resolve(false);
  return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
@@ -1345,8 +1362,8 @@ function initFirebase(){
         fbApplying=false;
         if(typeof render==='function'){buildPeriod(S.start);render()}
       });
-    }).catch((e)=>{ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요'); });
-  }catch(e){ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요'); }
+    }).catch((e)=>{ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection'); });
+  }catch(e){ fbReady=false;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection'); }
 }
 /* 조리장이 짠 식단을 검색·위험군·끌어오기 풀에 누적 (원본 3년치는 안 건드림) */
 function absorbPlan(){
@@ -1550,7 +1567,14 @@ function refDaySet(target,usedMains){
   }
   return firstComplete||fallback;                 // 안 겹치는 게 없으면 완성된 날, 그것도 없으면 알찬 날
 }
-function buildPeriod(start){
+function preserveEmptyMeal(date,meal){
+  const cell=S.plan&&S.plan[date]&&S.plan[date][meal];
+  if(cell&&cell.items&&cell.items.length)return false;
+  const key=date+'|'+meal;
+  return !!((S.cleared||{})[key]) || +((S._ts&&S._ts.plan||{})[key])>0;
+}
+function buildPeriod(start,options){
+  const forceRef=!!(options&&options.explicitRefReset);
   const usedMains=new Set();
   // 이미 손대지 않은(자동) 날만 새로 채우되, 그 주에 쓰인 메인을 누적해 중복 회피
   periodDates(start).forEach(d=>{
@@ -1559,20 +1583,21 @@ function buildPeriod(start){
       ['점심','저녁'].forEach(m=>{const mn=mealMainName(((S.plan[d][m]&&S.plan[d][m].items)||[]).map(it=>it.n));if(mn)usedMains.add(mn);});
       return;
     }
+    const keepEmpty=meal=>!forceRef&&preserveEmptyMeal(d,meal);
     // 그 날짜 자체에 실제 과거 기록이 있으면(예: 직접 넣은 6/15 주) 그걸 그대로 사용
     if(BYDAY[d]&&((BYDAY[d]['점심']||[]).length||(BYDAY[d]['저녁']||[]).length)){
-      const lunch0=pullMeal(d,'점심'), dinner0=pullMeal(d,'저녁');
-      const bf0=(BYDAY[d]['조식']||[]).length?pullMeal(d,'조식'):BREAKFAST_BASE.map(n=>({n}));
+      const lunch0=keepEmpty('점심')?[]:pullMeal(d,'점심'), dinner0=keepEmpty('저녁')?[]:pullMeal(d,'저녁');
+      const bf0=keepEmpty('조식')?[]:((BYDAY[d]['조식']||[]).length?pullMeal(d,'조식'):BREAKFAST_BASE.map(n=>({n})));
       [lunch0,dinner0].forEach(its=>{const mn=mealMainName(its.map(it=>it.n));if(mn)usedMains.add(mn);});
       S.plan[d]={조식:{items:bf0},점심:{items:lunch0},저녁:{items:dinner0}};
       return;
     }
     const ref=refDaySet(d,usedMains);             // 하루 세트 참조일 (기존 메인과 안 겹치게)
-    const lunch=ref?pullMeal(ref,'점심'):[], dinner=ref?pullMeal(ref,'저녁'):[];
+    const lunch=!keepEmpty('점심')&&ref?pullMeal(ref,'점심'):[], dinner=!keepEmpty('저녁')&&ref?pullMeal(ref,'저녁'):[];
     [lunch,dinner].forEach(its=>{const mn=mealMainName(its.map(it=>it.n));if(mn)usedMains.add(mn);});
-    S.plan[d]={조식:{items:BREAKFAST_BASE.map(n=>({n}))},   // 조식은 기본 3개만, 나머지는 검색해서 채움
-               점심:{items:lunch,ref:ref},
-               저녁:{items:dinner,ref:ref}};
+    S.plan[d]={조식:{items:keepEmpty('조식')?[]:BREAKFAST_BASE.map(n=>({n}))},   // 삭제한 조식도 보존
+               점심:keepEmpty('점심')?{items:[]}:{items:lunch,ref:ref},
+               저녁:keepEmpty('저녁')?{items:[]}:{items:dinner,ref:ref}};
   });
   // 일요일 도시락 — 매주 달라서 자동으로 안 채움. 공란으로 두고 조리장이 직접 적음.
   [addDays(start,6), addDays(start,13)].forEach(sun=>{
@@ -2548,7 +2573,7 @@ function move(n){rememberViewStart(addDays(S.start,n*7));render()}
 function resetToRef(){
   if(!confirm('이 2주를 작년 같은 기간 식단으로 다시 채울까요? 지금 바꾼 내용은 사라집니다.'))return;
   periodDates(S.start).forEach(d=>{delete S.plan[d]});
-  buildPeriod(S.start);save();render();
+  buildPeriod(S.start,{explicitRefReset:true});save();render();
   toast('작년 같은 기간으로 다시 채웠어요',false);
 }
 
@@ -2875,13 +2900,13 @@ function ordFlushSharedStateNow(){
   if(ordSaveInFlight){ordSaveQueued=true;return Promise.resolve(false);}
   ordSaveInFlight=true;setSyncBadge('busy','공유 저장 중');
   var p;
-  try{p=ordWriteSharedState();}catch(e){ordSaveQueued=true;ordSaveInFlight=false;showSaveProblem(e);setSyncBadge('busy','공유 확인 중');clearTimeout(ordSaveRetryTimer);ordSaveRetryTimer=setTimeout(function(){ordFlushSharedStateNow();},3000);return Promise.resolve(false);}
+  try{p=ordWriteSharedState();}catch(e){ordSaveQueued=true;ordSaveInFlight=false;showSaveProblem(e,'order');setSyncBadge('busy','공유 확인 중');clearTimeout(ordSaveRetryTimer);ordSaveRetryTimer=setTimeout(function(){ordFlushSharedStateNow();},3000);return Promise.resolve(false);}
   var ok=true;
-  return Promise.resolve(p).catch(function(e){ok=false;ordSaveQueued=true;showSaveProblem(e);setSyncBadge('busy','공유 확인 중');clearTimeout(ordSaveRetryTimer);ordSaveRetryTimer=setTimeout(function(){ordFlushSharedStateNow();},3000);}).then(function(){
+  return Promise.resolve(p).catch(function(e){ok=false;ordSaveQueued=true;showSaveProblem(e,'order');setSyncBadge('busy','공유 확인 중');clearTimeout(ordSaveRetryTimer);ordSaveRetryTimer=setTimeout(function(){ordFlushSharedStateNow();},3000);}).then(function(){
     ordSaveInFlight=false;
     if(!ok)return false;
     if(ordSaveQueued){ordSaveQueued=false;setTimeout(function(){ordFlushSharedStateNow();},50);}
-    else if(!saveInFlight&&!saveQueued&&!appUpdatePending){ordClearPendingShared();ordDirtyReset();ordWriteLocal();setSyncBadge(officialUrlWarning()?'warn':'ok',officialUrlWarning()?'공식 주소 아님':'공유 저장됨');}
+    else if(!saveInFlight&&!saveQueued&&!appUpdatePending){ordClearPendingShared();ordDirtyReset();ordWriteLocal();setSyncBadge('ok','공유 저장됨','order');}
     maybeReloadForUpdate();
     return true;
   });
@@ -3088,7 +3113,7 @@ function ordInitFirebase(){
       }
       else if(ordHasData()&&ALLOW_EMPTY_REMOTE_ORDER_IMPORT){ordMarkPendingShared();try{Promise.resolve(ordWriteSharedState()).catch(function(e){showSaveProblem(e);});}catch(e){showSaveProblem(e);}}
       else if(!hasRemote){ordResetStateForEmptyRemote();}
-      ordApplying=false;ordReady=true;centralMarkReady('order');
+      ordApplying=false;ordReady=true;centralMarkReady('order');setSyncBadge('ok','','order-connection');
       if(ordSaveQueued){ordSaveQueued=false;ordQueueSharedStateWrite();}
       if(pendingLocal&&ordDirtyAny()){setSyncBadge('busy','미동기화 발주 저장 중');ordQueueSharedStateWrite();}
       if(repaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
@@ -3101,8 +3126,8 @@ function ordInitFirebase(){
         if(typeof ordRenderBoard==='function')ordRenderBoard();
         if(rrRepaired){setTimeout(function(){try{ordWriteSharedState();}catch(e){}},800);}
       });
-    }).catch(function(e){ordReady=false;centralMarkBlocked('order',e);setSyncBadge('warn','관리자 확인 필요');if(typeof ordRenderBoard==='function')ordRenderBoard();});
-  }catch(e){ordReady=false;centralMarkBlocked('order',e);setSyncBadge('warn','관리자 확인 필요');}
+    }).catch(function(e){ordReady=false;centralMarkBlocked('order',e);setSyncBadge('warn','관리자 확인 필요','order-connection');if(typeof ordRenderBoard==='function')ordRenderBoard();});
+  }catch(e){ordReady=false;centralMarkBlocked('order',e);setSyncBadge('warn','관리자 확인 필요','order-connection');}
 }
 var ordMain='week', ordModal=null, ordChipKey=null, ordVenTidy=false, ordPeriod='week', ordPF='', ordPT='', ordVenManage=false;
 
@@ -3947,18 +3972,18 @@ function bareunCreateDraftStore(namespace){
   };
   var originalSaveMealMemo=window.saveFoodMealMemo;
   window.saveFoodMealMemo=function(){
-    var ta=document.getElementById('foodMealMemoText'),id=ta&&ta.dataset.editMealMemoId,item=id&&findMealMemo(id);if(!id)return originalSaveMealMemo&&originalSaveMealMemo();if(!item){setSyncBadge('warn','메모가 변경되거나 삭제되었습니다 · 입력 유지');return Promise.resolve({ok:false,reason:'conflict'})}
+    var ta=document.getElementById('foodMealMemoText'),id=ta&&ta.dataset.editMealMemoId,item=id&&findMealMemo(id);if(!id)return originalSaveMealMemo&&originalSaveMealMemo();if(!item){setSyncBadge('warn','메모가 변경되거나 삭제되었습니다 · 입력 유지','memo-action');return Promise.resolve({ok:false,reason:'conflict'})}
     var text=String(ta.value||'').trim();if(!text){toast('메모를 적어 주세요.',false);return Promise.resolve({ok:false})}
     var before=S.mealNotes&&S.mealNotes[item.bucket]||{},after=JSON.parse(JSON.stringify(before)),target=Array.isArray(after)?after[item.index]:after[item.noteId||item.id];
-    var expected;try{expected=JSON.parse(ta.dataset.mealMemoBase||'null')}catch(_){}if(!target||!expected||!window.bareunMealMemoSame(target,expected)){setSyncBadge('warn','메모가 변경되었습니다 · 입력 유지');return Promise.resolve({ok:false,reason:'conflict'})}
+    var expected;try{expected=JSON.parse(ta.dataset.mealMemoBase||'null')}catch(_){}if(!target||!expected||!window.bareunMealMemoSame(target,expected)){setSyncBadge('warn','메모가 변경되었습니다 · 입력 유지','memo-action');return Promise.resolve({ok:false,reason:'conflict'})}
     var value=Object.assign({},target,{text:text,updatedAt:Date.now()});if(Array.isArray(after))after[item.index]=value;else after[item.noteId||item.id]=value;
     return window.bareunCommitMealMemoUi({action:'edit',bucket:item.bucket,targetKey:Array.isArray(after)?item.index:(item.noteId||item.id),before:before,after:after});
   };
   window.bareunDeleteMealMemo=function(id,expected){
-    var item=findMealMemo(id);if(!item){setSyncBadge('warn','메모가 변경되거나 삭제되었습니다 · 원문 유지');return false}
+    var item=findMealMemo(id);if(!item){setSyncBadge('warn','메모가 변경되거나 삭제되었습니다 · 원문 유지','memo-action');return false}
     var before=S.mealNotes&&S.mealNotes[item.bucket]||{},target=Array.isArray(before)?before[item.index]:before[item.noteId||item.id];if(!target)return false;
     if(!expected){var original=JSON.parse(JSON.stringify(target));if(window.confirm('이 끼니 메모를 삭제할까요?'))return window.bareunDeleteMealMemo(id,original);return true}
-    if(!window.bareunMealMemoSame(target,expected)){setSyncBadge('warn','메모가 변경되었습니다 · 삭제하지 않았습니다');return false}
+    if(!window.bareunMealMemoSame(target,expected)){setSyncBadge('warn','메모가 변경되었습니다 · 삭제하지 않았습니다','memo-action');return false}
     var after=JSON.parse(JSON.stringify(before));if(Array.isArray(after)){after.splice(item.index,1);if(!after.length)after=null}else{delete after[item.noteId||item.id];if(!Object.keys(after).length)after=null}
     return window.bareunCommitMealMemoUi({action:'delete',bucket:item.bucket,draftKey:JSON.stringify([item.date,item.meal,'edit:'+item.bucket+'|'+(item.noteId||item.id)]),originalText:String(expected.text||''),before:before,after:after});
   };
@@ -3973,10 +3998,10 @@ function bareunCreateDraftStore(namespace){
  function select(date,meal,target){if(document.getElementById('foodMealMemoText')&&document.getElementById('foodMealMemoText').dataset.mealDraftKey)capture();var ctx=contextKey(date,meal);if(!target)target=newTargets[ctx]||(newTargets[ctx]='new:'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));active={date:date,meal:meal,target:target};return JSON.stringify([date,meal,target])}
  function key(){if(!active||active.date!==cur.date||active.meal!==cur.meal){var ctx=contextKey(cur.date,cur.meal),target=newTargets[ctx]||(newTargets[ctx]='new:'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));active={date:cur.date,meal:cur.meal,target:target}}return JSON.stringify([active.date,active.meal,active.target])}
  function persist(){return store.save(clone(drafts))}
- function capture(){if(suppressCapture)return;var ta=document.getElementById('foodMealMemoText');if(!ta)return;var k=ta.dataset.mealDraftKey||key(),pair=JSON.parse(k),d=drafts[k]||{date:pair[0],meal:pair[1]};d.text=ta.value;d.editId=ta.dataset.editMealMemoId||d.editId||'';if(ta.dataset.mealMemoBase)d.base=ta.dataset.mealMemoBase;drafts[k]=d;persist().catch(function(){setSyncBadge('warn','입력 보관 실패 · 창을 닫지 마세요')})}
+ function capture(){if(suppressCapture)return;var ta=document.getElementById('foodMealMemoText');if(!ta)return;var k=ta.dataset.mealDraftKey||key(),pair=JSON.parse(k),d=drafts[k]||{date:pair[0],meal:pair[1]};d.text=ta.value;d.editId=ta.dataset.editMealMemoId||d.editId||'';if(ta.dataset.mealMemoBase)d.base=ta.dataset.mealMemoBase;drafts[k]=d;persist().catch(function(){setSyncBadge('warn','입력 보관 실패 · 창을 닫지 마세요','draft-write')})}
  document.addEventListener('input',function(e){if(e.target&&e.target.id==='foodMealMemoText')capture()},true);
  var draw=drawSheet;drawSheet=function(){capture();var result=draw.apply(this,arguments),ta=document.getElementById('foodMealMemoText'),d=drafts[key()];if(ta)ta.dataset.mealDraftKey=key();if(ta&&d){ta.value=d.text||'';if(d.editId)ta.dataset.editMealMemoId=d.editId;if(d.base)ta.dataset.mealMemoBase=d.base}return result};
- store.load().then(function(saved){Object.keys(saved||{}).forEach(function(k){if(!drafts[k])drafts[k]=saved[k];try{var pair=JSON.parse(k);if(String(pair[2]||'').indexOf('new:')===0){var ctx=contextKey(pair[0],pair[1]);if(!newTargets[ctx])newTargets[ctx]=pair[2];if(active&&active.date===pair[0]&&active.meal===pair[1]&&!drafts[key()])active.target=pair[2]}}catch(_){}});var ta=document.getElementById('foodMealMemoText'),d=drafts[key()];if(ta&&d&&!ta.value){ta.value=d.text||'';if(d.editId)ta.dataset.editMealMemoId=d.editId;if(d.base)ta.dataset.mealMemoBase=d.base}}).catch(function(){setSyncBadge('warn','이전 입력 확인 실패 · 현재 입력 유지')});
+ store.load().then(function(saved){Object.keys(saved||{}).forEach(function(k){if(!drafts[k])drafts[k]=saved[k];try{var pair=JSON.parse(k);if(String(pair[2]||'').indexOf('new:')===0){var ctx=contextKey(pair[0],pair[1]);if(!newTargets[ctx])newTargets[ctx]=pair[2];if(active&&active.date===pair[0]&&active.meal===pair[1]&&!drafts[key()])active.target=pair[2]}}catch(_){}});var ta=document.getElementById('foodMealMemoText'),d=ta&&cur&&cur.date&&cur.meal?drafts[key()]:null;if(ta&&d&&!ta.value){ta.value=d.text||'';if(d.editId)ta.dataset.editMealMemoId=d.editId;if(d.base)ta.dataset.mealMemoBase=d.base}}).catch(function(error){setSyncBadge('warn','이전 입력 확인 실패 · 현재 입력 유지','draft-read',String(error&&error.message||error));console.warn('[meal-draft-read]',error)});
  window.bareunMealUiSelect=select;
  window.bareunMealMemoSame=same;
  window.bareunMealUiDraft=function(){return clone(drafts[key()]||null)};
@@ -3990,11 +4015,11 @@ function bareunCreateDraftStore(namespace){
    return save();
   }).then(function(result){
    if(!result||result.ok!==true||!result.payload||!same(result.payload.after&&result.payload.after.mealNotes&&result.payload.after.mealNotes[request.bucket]||null,request.after))throw Error('meal_memo_ack_missing');
-   var current=drafts[k],editor=document.getElementById('foodMealMemoText'),samePanel=key()===k&&!!editor;
+   setSyncBadge('ok','','memo-action');var current=drafts[k],editor=document.getElementById('foodMealMemoText'),samePanel=key()===k&&!!editor;
    if(samePanel&&String(editor.value)!==sentText){current=current||d;current.text=String(editor.value);drafts[k]=current}
-   if(current&&current.text!==sentText){current.status='draft';if(request.action==='edit'){current.base=JSON.stringify(request.after[request.targetKey]);if(samePanel)editor.dataset.mealMemoBase=current.base}delete current.request;delete current.operationId;delete current.operationHash;persist().catch(function(){});setSyncBadge('ok','');return result}
+   if(current&&current.text!==sentText){current.status='draft';if(request.action==='edit'){current.base=JSON.stringify(request.after[request.targetKey]);if(samePanel)editor.dataset.mealMemoBase=current.base}delete current.request;delete current.operationId;delete current.operationHash;persist().catch(function(){});setSyncBadge('ok','','memo-action');return result}
    delete drafts[k];if(active&&String(active.target).indexOf('new:')===0&&key()===k)delete newTargets[contextKey(active.date,active.meal)];persist().catch(function(){});if(samePanel&&String(editor.value)===sentText){suppressCapture=true;try{window.closeFoodMealMemo()}finally{suppressCapture=false}}render();toast(request.action==='delete'?'끼니 메모를 삭제했어요.':'끼니 메모를 저장했어요.',false);return result;
-  }).catch(function(error){var current=drafts[k]||d;current.status='unconfirmed';if(error&&error.operationId){current.operationId=error.operationId;current.operationHash=error.operationHash}drafts[k]=current;persist().catch(function(){});setSyncBadge('warn',/conflict/i.test(String(error&&error.message))?'다른 기기 변경과 충돌 · 입력 유지':'저장 확인이 끝나지 않았습니다 · 입력 유지');return {ok:false,reason:String(error&&error.message||error)}}).finally(function(){delete flights[k]});flights[k]=task;return task;
+  }).catch(function(error){var current=drafts[k]||d;current.status='unconfirmed';if(error&&error.operationId){current.operationId=error.operationId;current.operationHash=error.operationHash}drafts[k]=current;persist().catch(function(){});setSyncBadge('warn',/conflict/i.test(String(error&&error.message))?'다른 기기 변경과 충돌 · 입력 유지':'저장 확인이 끝나지 않았습니다 · 입력 유지','memo-action');return {ok:false,reason:String(error&&error.message||error)}}).finally(function(){delete flights[k]});flights[k]=task;return task;
  };
 })();
 </script>
@@ -4037,14 +4062,15 @@ function bareunCreateDraftStore(namespace){
   S.lunchboxDates=S.lunchboxDates||{};
   var lunchboxMore=false;
   var baseCellHtml=cellHtml,baseOpenGuide=openGuide,baseDrawMealFind=drawMealFind,baseCellClick=cellClick,basePickSwap=pickSwap,baseBuildPeriod=buildPeriod;
-  buildPeriod=function(start){
-    baseBuildPeriod(start);
+  buildPeriod=function(start,options){
+    baseBuildPeriod(start,options);
+    var forceRef=!!(options&&options.explicitRefReset);
     var used=new Set();
     periodDates(start).forEach(function(d){
       var day=S.plan[d]||(S.plan[d]={});
       ['점심','저녁'].forEach(function(meal){
-        var cell=day[meal],items=((cell||{}).items||[]),cleared=!!((S.cleared||{})[d+'|'+meal]);
-        if(items.length||cleared){var main=mealMainName(items.map(function(it){return it.n}));if(main)used.add(main);return}
+        var cell=day[meal],items=((cell||{}).items||[]),cleared=!forceRef&&preserveEmptyMeal(d,meal);
+        if(items.length||cleared){if(cleared&&!cell)day[meal]={items:[]};var main=mealMainName(items.map(function(it){return it.n}));if(main)used.add(main);return}
         var direct=pullMeal(d,meal);
         if(mealComplete(direct,meal)){day[meal]={items:direct,ref:d};}
         else{
@@ -4053,7 +4079,7 @@ function bareunCreateDraftStore(namespace){
         }
         var nextMain=mealMainName((day[meal].items||[]).map(function(it){return it.n}));if(nextMain)used.add(nextMain);
       });
-      if(!day['조식'])day['조식']={items:BREAKFAST_BASE.map(function(n){return {n:n}})};
+      if(!day['조식'])day['조식']={items:!forceRef&&preserveEmptyMeal(d,'조식')?[]:BREAKFAST_BASE.map(function(n){return {n:n}})};
     });
   };
   function validLunchboxDate(value){
