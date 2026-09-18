@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260917_verified_first_render'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260918_shared_save_recovery'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -1094,6 +1094,7 @@ function showSaveProblem(e,scope){
   centralGate.lastDetail=msg;
   setSyncBadge('warn','공유 확인 필요',scope,msg);
   if(window.console)console.warn('[shared-save]',msg);
+  try{updateSharedSaveAction()}catch(_){}
 }
 function showBootMessage(msg,bad){
   const el=document.getElementById('weeks');
@@ -1134,7 +1135,7 @@ function checkAppVersion(){
 // Candidate only. No browser storage/network side effects until explicitly instantiated.
 function createSharedJournalCore(options){
  const clone=x=>JSON.parse(JSON.stringify(x)),own=(o,k)=>Object.prototype.hasOwnProperty.call(o||{},k);
- function error(code){const e=new Error(code==='SHARED_CONFLICT'?'다른 저장과 겹쳐 공유하지 않았습니다. 입력은 보관되어 있습니다.':code);e.code=code;return e;}
+ function error(code){const e=new Error(code==='SHARED_CONFLICT'?'다른 저장과 겹쳐 공유하지 않았습니다. 입력은 보관되어 있습니다.':code==='SHARED_RESOLUTION_REVIEW_REQUIRED'?'일부 식단이 다른 창에서 처리되었습니다. 다시 비교해 주세요.':code);e.code=code;return e;}
  // Firebase removes null/empty nodes and may represent indexed children as arrays.
  // Normalize only for comparison; keep captured input bytes and applied values intact.
  function canonical(x){if(x===null||x===undefined)return undefined;if(x&&typeof x==='object'){const children=Object.keys(x).sort().map(k=>[k,canonical(x[k])]).filter(pair=>pair[1]!==undefined);return children.length?'{'+children.map(pair=>JSON.stringify(pair[0])+':'+pair[1]).join(',')+'}':undefined;}return JSON.stringify(x);}
@@ -1171,7 +1172,7 @@ function createSharedJournalCore(options){
   intent.changes.forEach(c=>{
    const current=c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(out,c.path);
    if(same(current,c.after))return;
-   if(!overlay&&!same(current,c.before))throw error('SHARED_CONFLICT');
+   if(!overlay&&!same(current,c.before)){const e=error('SHARED_CONFLICT');e.details=[{path:clone(c.path),before:clone(c.before),after:clone(c.after),current:clone(current)}];throw e;}
    todo.push(c);
   });
   if(!todo.length)return out;
@@ -1187,6 +1188,10 @@ function createSharedJournalCore(options){
  }
  let ready=null,failed=null,inflight=null,tail=Promise.resolve(),records=[],staged=[];
  const remoteAcks=new Map();
+ let blocked=[];
+ const planOnly=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>Array.isArray(c.path)&&c.path.length===3&&c.path[0]==='plan'&&c.path.every(k=>typeof k==='string'&&k.length>0));
+ const overlaps=(a,b)=>a.slice(0,Math.min(a.length,b.length)).every((v,i)=>v===b[i]);
+ function pendingDetails(){return clone({pending:records,staged,blocked,failure:failed?{code:failed.code||failed.message||'SHARED_FAILED'}:null});}
  const journal=options.journal;
  async function prepare(){
   if(ready)return ready;
@@ -1199,32 +1204,108 @@ function createSharedJournalCore(options){
   const work=tail.then(async()=>{await prepare();if(failed)throw failed;const record=await journal.put(item.id,item.payload);records.push(record);staged=staged.filter(x=>x!==item);return {verified:true,id:record.id,hash:record.hash};});
   tail=work.catch(e=>{failed=e;options.onError(e);});return work;
  }
- function overlay(remote){let out=clone(remote||{});for(const record of records)out=apply(out,record.payload,true);for(const item of staged)out=apply(out,item.payload,true);return out;}
+
+ // Resolution manifests retain the original journal records. A server receipt,
+ // written atomically with the selected cells, is the only retirement evidence.
+ function resolutionProof(remote,record){
+  const link=(remote._sharedResolvedInputs||{})[record.id];
+  const proof=link&&(remote._sharedResolutions||{})[link.resolutionId];
+  return !!(link&&link.hash===record.hash&&proof&&proof.hash===link.resolutionHash&&proof.originals&&proof.originals[record.id]===record.hash);
+ }
+ function retireResolved(remote){
+  const resolved=new Set(records.filter(r=>resolutionProof(remote||{},r)).map(r=>r.id));
+  records=records.filter(r=>!resolved.has(r.id));blocked=blocked.filter(r=>!resolved.has(r.id));
+ }
+ async function resolutionPreview(remote){
+  await prepare();await tail;if(failed||staged.length)throw failed||error('입력 보관이 끝난 뒤 다시 확인해 주세요.');
+  retireResolved(remote);const pending=[];
+  for(const r of records){const d=await journal.get(r.id);if(d.hash!==r.hash)throw error('SHARED_JOURNAL_MISMATCH');if(d.state==='pending')pending.push(r);}
+  if(!pending.length)throw error('저장되지 않은 식단이 없습니다.');
+  if(!pending.every(planOnly))throw error('확정·메모 등과 함께 변경된 입력입니다. 원문을 보존했으며 관리자 확인이 필요합니다.');
+  const before={plan:{}},after={plan:{}},paths=new Map();
+  for(const r of pending)for(const c of r.payload.changes)paths.set(JSON.stringify(c.path),c.path);
+  for(const p of paths.values()){change(before,p,value(remote,p));change(after,p,value(remote,p));}
+  for(const r of pending)for(const c of r.payload.changes)change(after,c.path,c.after);
+  return clone({refs:pending.map(r=>({id:r.id,hash:r.hash})),before,after,paths:[...paths.values()],guards:[...paths.values()].map(p=>({path:['_ts','plan',p[1]+'|'+p[2]],expected:value(remote,['_ts','plan',p[1]+'|'+p[2]])}))});
+ }
+ async function queueResolution(preview,choice){
+  if(!options.resolutions)throw error('저장 복구 보관소가 없습니다.');
+  if(choice!=='local'&&choice!=='remote')throw error('INVALID_RESOLUTION_CHOICE');
+  await prepare();await tail;if(failed||staged.length)throw failed||error('입력 보관 중입니다.');
+  const refs=preview.refs;for(const ref of refs){const r=await journal.get(ref.id);if(r.hash!==ref.hash||r.state!=='pending')throw error('다른 창에서 저장 상태가 바뀌었습니다. 다시 확인해 주세요.');}
+  const current=records.map(r=>({id:r.id,hash:r.hash}));if(!same(current,refs))throw error('확인 중 식단이 변경되었습니다. 다시 확인해 주세요.');
+  const resolutionId='shared_resolution_'+options.randomId();
+  const after=clone(choice==='local'?preview.after:preview.before);
+  for(const p of preview.paths){const cell=value(after,p),v=cell.exists&&cell.value&&typeof cell.value==='object'?cell.value:{items:[]};v._sharedSaveGeneration=resolutionId;change(after,p,{exists:true,value:v});}
+  const intent=build(preview.before,after,{});
+  // Even unchanged cells are CAS guards: a later employee edit must abort all.
+  intent.changes=preview.paths.map(p=>({path:p,before:value(preview.before,p),after:value(after,p),stampKind:'plan',stampKey:p[1]+'|'+p[2]}));
+  const prior=await options.resolutions.pending();
+  return options.resolutions.put(resolutionId,{version:1,kind:'shared-resolution',refs:clone(refs),intent,guards:clone(preview.guards),choice,supersedes:prior.map(r=>({id:r.id,hash:r.hash}))},{retainAcknowledged:true});
+ }
+ async function drainResolutions(){
+  if(!options.resolutions)return;
+  const manifests=await options.resolutions.pending(),superseded=new Set();
+  for(const r of manifests){const p=r.payload;if(p.version!==1||p.kind!=='shared-resolution'||!Array.isArray(p.refs)||!Array.isArray(p.guards)||!planOnly({payload:p.intent}))throw error('INVALID_RESOLUTION_MANIFEST');for(const ref of p.supersedes||[]){const prior=manifests.find(m=>m.id===ref.id);if(!prior||prior.hash!==ref.hash)throw error('INVALID_RESOLUTION_LINEAGE');superseded.add(ref.id);}}
+  for(const manifest of manifests){
+   if(superseded.has(manifest.id))continue;
+   for(const ref of manifest.payload.refs){const r=await journal.get(ref.id);if(r.hash!==ref.hash)throw error('SHARED_JOURNAL_MISMATCH');}
+   let issue=null,obsolete=false;
+   const result=await options.transaction(remote=>{issue=null;obsolete=false;
+    try{
+     const proof=(remote._sharedResolutions||{})[manifest.id];
+     if(proof){if(proof.hash!==manifest.hash)throw error('SHARED_RESOLUTION_MISMATCH');return remote;}
+     const retired=manifest.payload.refs.filter(r=>resolutionProof(remote,r)).length;
+     if(retired===manifest.payload.refs.length){obsolete=true;return remote;}
+     if(retired)throw error('SHARED_RESOLUTION_REVIEW_REQUIRED');
+     for(const g of manifest.payload.guards)if(!same(value(remote,g.path),g.expected))throw error('SHARED_CONFLICT');
+     const out=apply(remote,manifest.payload.intent,false);
+     out._sharedResolutions=out._sharedResolutions||{};out._sharedResolvedInputs=out._sharedResolvedInputs||{};
+     const originals={};for(const ref of manifest.payload.refs){originals[ref.id]=ref.hash;out._sharedResolvedInputs[ref.id]={hash:ref.hash,resolutionId:manifest.id,resolutionHash:manifest.hash};}
+     out._sharedResolutions[manifest.id]={hash:manifest.hash,originals,choice:manifest.payload.choice};return out;
+    }catch(e){issue=e;return undefined;}
+   });
+   if(issue)throw issue;if(!result||!result.committed||!result.verifiedSnapshot)throw error('SHARED_ACK_MISMATCH');
+   const proof=(result.verifiedSnapshot._sharedResolutions||{})[manifest.id];
+   if(!obsolete&&(!proof||proof.hash!==manifest.hash||!manifest.payload.refs.every(r=>resolutionProof(result.verifiedSnapshot,r))))throw error('SHARED_ACK_MISMATCH');
+   retireResolved(result.verifiedSnapshot);
+  }
+ }
+
+ function overlay(remote){retireResolved(remote||{});let out=clone(remote||{});for(const record of records)out=apply(out,record.payload,true);for(const item of staged)out=apply(out,item.payload,true);return out;}
  async function drain(){
   if(inflight)return inflight;
   inflight=(async()=>{await prepare();await tail;if(failed)throw failed;
-   while(records.length){const record=records[0];let conflict=null;
+   await drainResolutions();blocked=[];const deferred=[],seen=new Set();let firstConflict=null;
+   while(true){await tail;if(failed)throw failed;const batch=records.filter(r=>!seen.has(r.id));if(!batch.length)break;
+   for(const record of batch){seen.add(record.id);let conflict=null,resolved=false;
     const durable=await journal.get(record.id);
     if(!durable||durable.id!==record.id||durable.hash!==record.hash)throw error('SHARED_JOURNAL_MISMATCH');
     if(durable.state==='acked'){records=records.filter(r=>r.id!==record.id);continue;}
     if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
     const proved=remoteAcks.get(record.id);
     if(proved&&proved.id===record.id&&proved.hash===record.hash){await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
-    const result=await options.transaction(current=>{try{return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
-    if(conflict)throw conflict;if(!result||!result.committed)throw error('SHARED_NOT_COMMITTED');
-    if(result.verifiedSnapshot){
-     const snapshot=result.verifiedSnapshot,saved=options.savedToMap(snapshot.saved||[]);
-     if(!record.payload.changes.every(c=>same(c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(snapshot,c.path),c.after)))throw error('SHARED_ACK_MISMATCH');
-     remoteAcks.set(record.id,{id:record.id,hash:record.hash,payload:record.payload,state:'server-acked'});
-    }
+    const parents=deferred.filter(prior=>!planOnly(record)||!planOnly(prior)||record.payload.changes.some(c=>prior.payload.changes.some(p=>overlaps(c.path,p.path))));
+    if(parents.length){deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'dependent',blockedBy:parents.map(p=>p.id),paths:clone(record.payload.changes.map(c=>c.path))});continue;}
+    const result=await options.transaction(current=>{conflict=null;resolved=false;try{if(resolutionProof(current,record)){resolved=true;return current;}return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
+    if(conflict){if(conflict.code!=='SHARED_CONFLICT')throw conflict;firstConflict=firstConflict||conflict;deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'conflict',blockedBy:[],paths:clone(record.payload.changes.map(c=>c.path)),details:clone(conflict.details||[])});continue;}
+    if(!result||!result.committed)throw error('SHARED_NOT_COMMITTED');
+    if(!result.verifiedSnapshot||typeof result.verifiedSnapshot!=='object')throw error('SHARED_ACK_MISMATCH');
+    const snapshot=result.verifiedSnapshot,saved=options.savedToMap(snapshot.saved||[]);
+    if(resolved){if(!resolutionProof(snapshot,record))throw error('SHARED_ACK_MISMATCH');retireResolved(snapshot);continue;}
+    if(!record.payload.changes.every(c=>same(c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(snapshot,c.path),c.after)))throw error('SHARED_ACK_MISMATCH');
+    remoteAcks.set(record.id,{id:record.id,hash:record.hash,payload:record.payload,state:'server-acked'});
     await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);
     if(options.onAck)options.onAck(record,result);
    }
+   }
+   if(firstConflict){firstConflict.blocked=clone(blocked);throw firstConflict;}
    return true;
   })();
   try{return await inflight;}finally{inflight=null;}
  }
- return {prepare,enqueue,drain,overlay,build,apply,remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
+
+ return {prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
 }
 
 let sharedJournalBaseline=stateClone(S),sharedJournalReady=false;
@@ -1233,8 +1314,9 @@ const sharedConnectionReady=new Promise((resolve,reject)=>{sharedResolveConnecti
 sharedConnectionReady.catch(()=>{});
 const sharedInputJournal=createBareunOperationJournal({namespace:'shared-menu'});
 const sharedInputArchive=createBareunBackupArchive();
+const sharedResolutionJournal=createBareunOperationJournal({namespace:'shared-menu-resolutions'});
 const sharedInputCore=createSharedJournalCore({
- journal:sharedInputJournal,savedToMap,savedFromMap,stateMaxTs,
+ journal:sharedInputJournal,resolutions:sharedResolutionJournal,savedToMap,savedFromMap,stateMaxTs,
  randomId:()=>crypto.randomUUID(),
  onError:e=>{setSyncBadge('warn','입력 보관 실패 · 창을 닫지 마세요');showSaveProblem(e)},
  archiveLegacy:async()=>{
@@ -1291,10 +1373,10 @@ window.bareunRetrySharedInput=async(id,hash)=>{
  return sharedWaitForAck({id,hash});
 };
 
-function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');return result;}
+function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');updateSharedSaveAction();return result;}
 function flushSharedStateNow(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady))return Promise.resolve(false);
- return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
+ return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
 }
 function queueSharedStateWrite(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady)){saveQueued=true;return;}
@@ -1304,8 +1386,48 @@ function flushBeforeLeave(){
  if(FB_ON&&sharedJournalReady)flushSharedStateNow();
  if(typeof ordFlushBeforeLeave==='function')ordFlushBeforeLeave();
 }
+
+let sharedUiSaveState='idle',sharedUiSaveNumber=0,sharedUiUndo=null,sharedUiMutationFrame=0;
+function updateSharedSaveAction(){
+ const header=document.querySelector('.topin');if(!header)return;
+ let button=document.getElementById('sharedSaveAction');
+ if(!button){button=document.createElement('button');button.id='sharedSaveAction';button.type='button';button.className='btn';button.onclick=openSharedSaveReview;header.appendChild(button);}
+ const pending=sharedInputCore.hasPending()||!!sharedInputCore.failure();
+ button.hidden=!pending;button.textContent=sharedInputCore.blocked().length?'저장 충돌 확인':sharedUiSaveState==='pending'?'공유 저장 중':'저장 상태 확인';
+ button.title='아직 공용 저장소에 반영되지 않은 입력을 확인합니다.';
+}
+async function openSharedSaveReview(){
+ let dialog=document.getElementById('sharedSaveReview');
+ if(!dialog){dialog=document.createElement('dialog');dialog.id='sharedSaveReview';dialog.style.cssText='max-width:850px;width:94vw;max-height:85vh;overflow:auto;border:1px solid #cbd5d1;border-radius:14px;padding:22px;color:#173b30;background:white';document.body.appendChild(dialog);}
+ if(dialog.open)return;dialog.innerHTML='<h2>공유 저장 확인</h2><p role="status">저장된 내용과 이 PC의 입력을 확인하고 있습니다.</p><button type="button" id="sharedReviewClose">닫기</button>';dialog.querySelector('#sharedReviewClose').onclick=()=>dialog.close();dialog.showModal();
+ try{
+  if(!fbReady||!fbRef)throw new Error('공유 연결을 확인할 수 없습니다. 입력은 유지됩니다.');
+  try{await sharedInputCore.drain()}catch(e){if(e.code!=='SHARED_CONFLICT'&&e.code!=='SHARED_RESOLUTION_REVIEW_REQUIRED')throw e;}
+  const remote=decodeSharedStateFromFirebase((await fbRef.once('value')).val());
+  if(!sharedInputCore.hasPending()){setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();dialog.querySelector('p').textContent='모든 입력의 공유 저장을 확인했습니다.';return;}
+  const preview=await sharedInputCore.resolutionPreview(remote);
+  const list=(state,p)=>{const cell=state.plan?.[p[1]]?.[p[2]];return cell&&cell.items&&cell.items.length?cell.items.map(x=>x.n).join('\n'):'메뉴 없음';};
+  dialog.innerHTML='<h2>저장되지 않은 식단 확인</h2><p>공용 식단과 이 PC의 수정 내용이 달라 자동으로 덮어쓰지 않았습니다. 아래 내용을 확인하고 사용할 식단을 선택해 주세요. 기존 입력 기록은 보관됩니다.</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;text-align:left"><thead><tr><th>날짜·끼니</th><th>현재 공용 식단</th><th>이 PC의 수정 식단</th></tr></thead><tbody>'+preview.paths.map(p=>'<tr><th style="padding:12px 8px;border-top:1px solid #ddd">'+esc(p[1]+' '+p[2])+'</th><td style="white-space:pre-line;padding:12px 8px;border-top:1px solid #ddd">'+esc(list(preview.before,p))+'</td><td style="white-space:pre-line;padding:12px 8px;border-top:1px solid #ddd">'+esc(list(preview.after,p))+'</td></tr>').join('')+'</tbody></table></div><p role="status" id="sharedReviewStatus">선택한 범위만 처리하며 다른 날짜와 업무 자료는 유지합니다.</p><div style="display:flex;gap:10px;flex-wrap:wrap"><button type="button" id="sharedReviewLocal">이 PC의 수정 식단으로 저장</button><button type="button" id="sharedReviewRemote">현재 공용 식단 유지</button><button type="button" id="sharedReviewClose">나중에 확인</button></div>';
+  dialog.querySelector('#sharedReviewClose').onclick=()=>dialog.close();
+  async function choose(choice){
+   const buttons=dialog.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);
+   const status=dialog.querySelector('#sharedReviewStatus');status.textContent='선택한 내용을 보관하고 공유 저장을 확인하고 있습니다. 연결이 끊겨도 기록은 유지됩니다.';
+   try{
+    await sharedInputCore.queueResolution(preview,choice);await sharedInputCore.drain();
+    const current=decodeSharedStateFromFirebase((await fbRef.once('value')).val());
+    fbApplying=true;try{applyRemoteState(sharedOverlayRemote(current),S.start);sharedJournalBaseline=stateClone(S);STATE_LAST=stateSnapshot();dirtyReset();pendingRemoteState=null;}finally{fbApplying=false;}
+    render();sharedUiSaveState='saved';setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();dialog.close();toast('선택한 식단의 공유 저장을 확인했습니다.',false);
+   }catch(e){showSaveProblem(e);status.textContent='처리 완료를 확인하지 못했습니다. 입력은 보관되어 있습니다. '+describeSaveError(e);dialog.querySelector('#sharedReviewClose').disabled=false;dialog.querySelector('#sharedReviewClose').textContent='닫고 다시 확인';}
+  }
+  dialog.querySelector('#sharedReviewLocal').onclick=()=>choose('local');dialog.querySelector('#sharedReviewRemote').onclick=()=>choose('remote');
+ }catch(e){dialog.querySelector('[role="status"]').textContent=describeSaveError(e);showSaveProblem(e);}
+}
+
 const save=()=>{
+ const uiNumber=++sharedUiSaveNumber;sharedUiSaveState='pending';sharedUiUndo=null;sharedUiMutationFrame=uiNumber;Promise.resolve().then(()=>{if(sharedUiMutationFrame===uiNumber)sharedUiMutationFrame=0;});
  const before=stateClone(sharedJournalBaseline);
+ // Keep a per-cell generation fence after explicit recovery, including whole-meal replacements.
+ for(const d of Object.keys(before.plan||{}))for(const m of Object.keys(before.plan[d]||{})){const generation=before.plan[d][m]&&before.plan[d][m]._sharedSaveGeneration;if(generation){S.plan[d]=S.plan[d]||{};S.plan[d][m]=S.plan[d][m]||{items:[]};S.plan[d][m]._sharedSaveGeneration=generation;}}
  stateStampDiff();
  if(!FB_ON||fbReady)stateRepairMissingTs(S,Date.now());else stateEnsureShape(S);
  lastLocalSave=Date.now();S.planLogicVer=PLAN_LOGIC_VER;S.updatedAt=nowStamp();dirtyMark('meta');
@@ -1314,6 +1436,8 @@ const save=()=>{
  sharedJournalBaseline=stateClone(after);dirtyReset();
  setSyncBadge('busy','입력 보관 중');
  const completion=durable.then(sharedWaitForAck);
+ updateSharedSaveAction();
+ completion.then(result=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState=result.ok?'saved':'idle';updateSharedSaveAction();if(result.ok)toast('공유 저장됨 · 다른 기기에도 반영됩니다.',!!sharedUiUndo,sharedUiUndo&&sharedUiUndo.fn);},()=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState='failed';updateSharedSaveAction();toast('공유 저장 안 됨 · 입력은 보관 중입니다. 저장 상태를 확인해 주세요.',false);});
  completion.catch(error=>{showSaveProblem(error);setSyncBadge('warn','공유 확인 필요 · 입력은 유지됩니다');});
  return completion;
 };
@@ -2694,6 +2818,8 @@ function styleSheet(aoa,ncol){
 /* ===== 토스트 ===== */
 let toastT=null;
 function toast(msg,undoable,fn){const t=document.getElementById('toast');
+  if(sharedUiSaveState==='pending'&&(undoable||sharedUiMutationFrame)){if(undoable)sharedUiUndo={fn:fn||'undo'};msg='화면 수정 · 공유 저장 중';}
+  if(undoable&&sharedUiSaveState==='failed')msg='화면만 변경됨 · 공유 저장 안 됨';
   document.getElementById('toastMsg').textContent=msg;
   const btn=document.getElementById('toastBtn');
   btn.style.display=undoable?'':'none';
