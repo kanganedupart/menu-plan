@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260918_shared_save_recovery'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260918_automatic_save_status'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -1094,7 +1094,6 @@ function showSaveProblem(e,scope){
   centralGate.lastDetail=msg;
   setSyncBadge('warn','공유 확인 필요',scope,msg);
   if(window.console)console.warn('[shared-save]',msg);
-  try{updateSharedSaveAction()}catch(_){}
 }
 function showBootMessage(msg,bad){
   const el=document.getElementById('weeks');
@@ -1373,10 +1372,10 @@ window.bareunRetrySharedInput=async(id,hash)=>{
  return sharedWaitForAck({id,hash});
 };
 
-function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');updateSharedSaveAction();return result;}
+function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');return result;}
 function flushSharedStateNow(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady))return Promise.resolve(false);
- return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
+ return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
 }
 function queueSharedStateWrite(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady)){saveQueued=true;return;}
@@ -1388,40 +1387,6 @@ function flushBeforeLeave(){
 }
 
 let sharedUiSaveState='idle',sharedUiSaveNumber=0,sharedUiUndo=null,sharedUiMutationFrame=0;
-function updateSharedSaveAction(){
- const header=document.querySelector('.topin');if(!header)return;
- let button=document.getElementById('sharedSaveAction');
- if(!button){button=document.createElement('button');button.id='sharedSaveAction';button.type='button';button.className='btn';button.onclick=openSharedSaveReview;header.appendChild(button);}
- const pending=sharedInputCore.hasPending()||!!sharedInputCore.failure();
- button.hidden=!pending;button.textContent=sharedInputCore.blocked().length?'저장 충돌 확인':sharedUiSaveState==='pending'?'공유 저장 중':'저장 상태 확인';
- button.title='아직 공용 저장소에 반영되지 않은 입력을 확인합니다.';
-}
-async function openSharedSaveReview(){
- let dialog=document.getElementById('sharedSaveReview');
- if(!dialog){dialog=document.createElement('dialog');dialog.id='sharedSaveReview';dialog.style.cssText='max-width:850px;width:94vw;max-height:85vh;overflow:auto;border:1px solid #cbd5d1;border-radius:14px;padding:22px;color:#173b30;background:white';document.body.appendChild(dialog);}
- if(dialog.open)return;dialog.innerHTML='<h2>공유 저장 확인</h2><p role="status">저장된 내용과 이 PC의 입력을 확인하고 있습니다.</p><button type="button" id="sharedReviewClose">닫기</button>';dialog.querySelector('#sharedReviewClose').onclick=()=>dialog.close();dialog.showModal();
- try{
-  if(!fbReady||!fbRef)throw new Error('공유 연결을 확인할 수 없습니다. 입력은 유지됩니다.');
-  try{await sharedInputCore.drain()}catch(e){if(e.code!=='SHARED_CONFLICT'&&e.code!=='SHARED_RESOLUTION_REVIEW_REQUIRED')throw e;}
-  const remote=decodeSharedStateFromFirebase((await fbRef.once('value')).val());
-  if(!sharedInputCore.hasPending()){setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();dialog.querySelector('p').textContent='모든 입력의 공유 저장을 확인했습니다.';return;}
-  const preview=await sharedInputCore.resolutionPreview(remote);
-  const list=(state,p)=>{const cell=state.plan?.[p[1]]?.[p[2]];return cell&&cell.items&&cell.items.length?cell.items.map(x=>x.n).join('\n'):'메뉴 없음';};
-  dialog.innerHTML='<h2>저장되지 않은 식단 확인</h2><p>공용 식단과 이 PC의 수정 내용이 달라 자동으로 덮어쓰지 않았습니다. 아래 내용을 확인하고 사용할 식단을 선택해 주세요. 기존 입력 기록은 보관됩니다.</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;text-align:left"><thead><tr><th>날짜·끼니</th><th>현재 공용 식단</th><th>이 PC의 수정 식단</th></tr></thead><tbody>'+preview.paths.map(p=>'<tr><th style="padding:12px 8px;border-top:1px solid #ddd">'+esc(p[1]+' '+p[2])+'</th><td style="white-space:pre-line;padding:12px 8px;border-top:1px solid #ddd">'+esc(list(preview.before,p))+'</td><td style="white-space:pre-line;padding:12px 8px;border-top:1px solid #ddd">'+esc(list(preview.after,p))+'</td></tr>').join('')+'</tbody></table></div><p role="status" id="sharedReviewStatus">선택한 범위만 처리하며 다른 날짜와 업무 자료는 유지합니다.</p><div style="display:flex;gap:10px;flex-wrap:wrap"><button type="button" id="sharedReviewLocal">이 PC의 수정 식단으로 저장</button><button type="button" id="sharedReviewRemote">현재 공용 식단 유지</button><button type="button" id="sharedReviewClose">나중에 확인</button></div>';
-  dialog.querySelector('#sharedReviewClose').onclick=()=>dialog.close();
-  async function choose(choice){
-   const buttons=dialog.querySelectorAll('button');buttons.forEach(b=>b.disabled=true);
-   const status=dialog.querySelector('#sharedReviewStatus');status.textContent='선택한 내용을 보관하고 공유 저장을 확인하고 있습니다. 연결이 끊겨도 기록은 유지됩니다.';
-   try{
-    await sharedInputCore.queueResolution(preview,choice);await sharedInputCore.drain();
-    const current=decodeSharedStateFromFirebase((await fbRef.once('value')).val());
-    fbApplying=true;try{applyRemoteState(sharedOverlayRemote(current),S.start);sharedJournalBaseline=stateClone(S);STATE_LAST=stateSnapshot();dirtyReset();pendingRemoteState=null;}finally{fbApplying=false;}
-    render();sharedUiSaveState='saved';setSyncBadge('ok','공유 저장됨');updateSharedSaveAction();dialog.close();toast('선택한 식단의 공유 저장을 확인했습니다.',false);
-   }catch(e){showSaveProblem(e);status.textContent='처리 완료를 확인하지 못했습니다. 입력은 보관되어 있습니다. '+describeSaveError(e);dialog.querySelector('#sharedReviewClose').disabled=false;dialog.querySelector('#sharedReviewClose').textContent='닫고 다시 확인';}
-  }
-  dialog.querySelector('#sharedReviewLocal').onclick=()=>choose('local');dialog.querySelector('#sharedReviewRemote').onclick=()=>choose('remote');
- }catch(e){dialog.querySelector('[role="status"]').textContent=describeSaveError(e);showSaveProblem(e);}
-}
 
 const save=()=>{
  const uiNumber=++sharedUiSaveNumber;sharedUiSaveState='pending';sharedUiUndo=null;sharedUiMutationFrame=uiNumber;Promise.resolve().then(()=>{if(sharedUiMutationFrame===uiNumber)sharedUiMutationFrame=0;});
@@ -1436,8 +1401,8 @@ const save=()=>{
  sharedJournalBaseline=stateClone(after);dirtyReset();
  setSyncBadge('busy','입력 보관 중');
  const completion=durable.then(sharedWaitForAck);
- updateSharedSaveAction();
- completion.then(result=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState=result.ok?'saved':'idle';updateSharedSaveAction();if(result.ok)toast('공유 저장됨 · 다른 기기에도 반영됩니다.',!!sharedUiUndo,sharedUiUndo&&sharedUiUndo.fn);},()=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState='failed';updateSharedSaveAction();toast('공유 저장 안 됨 · 입력은 보관 중입니다. 저장 상태를 확인해 주세요.',false);});
+
+ completion.then(result=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState=result.ok?'saved':'idle';if(result.ok&&sharedUiUndo)toast(sharedUiUndo.msg,sharedUiUndo.undoable,sharedUiUndo.fn);},()=>{if(uiNumber!==sharedUiSaveNumber)return;sharedUiSaveState='failed';});
  completion.catch(error=>{showSaveProblem(error);setSyncBadge('warn','공유 확인 필요 · 입력은 유지됩니다');});
  return completion;
 };
@@ -2818,8 +2783,7 @@ function styleSheet(aoa,ncol){
 /* ===== 토스트 ===== */
 let toastT=null;
 function toast(msg,undoable,fn){const t=document.getElementById('toast');
-  if(sharedUiSaveState==='pending'&&(undoable||sharedUiMutationFrame)){if(undoable)sharedUiUndo={fn:fn||'undo'};msg='화면 수정 · 공유 저장 중';}
-  if(undoable&&sharedUiSaveState==='failed')msg='화면만 변경됨 · 공유 저장 안 됨';
+  if(sharedUiSaveState==='pending'&&(undoable||sharedUiMutationFrame)){sharedUiUndo={msg,undoable,fn:fn||'undo'};t.style.display='none';clearTimeout(toastT);return;}
   document.getElementById('toastMsg').textContent=msg;
   const btn=document.getElementById('toastBtn');
   btn.style.display=undoable?'':'none';
