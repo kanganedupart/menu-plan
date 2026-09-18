@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260918_automatic_save_status'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260918_shared_menu_fields'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -1164,12 +1164,31 @@ function createSharedJournalCore(options){
   if(!same(before.skip||[],after.skip||[]))changes.push({path:['skip'],before:{exists:true,value:before.skip||[]},after:{exists:true,value:after.skip||[]},stampKind:'skip',stampKey:null});
   return {version:1,kind:'explicit-shared-input',before,after,dirty:clone(dirty||{}),changes,at:Date.now()};
  }
+
+ // Keep durable input bytes unchanged. Existing menu edits compare only the fields
+ // actually edited, so a pending category edit cannot hide a newer allergy value.
+ function intentChanges(intent){
+  const out=[];const object=v=>v&&typeof v==='object'&&!Array.isArray(v);
+  for(const c of intent.changes){
+   if(c.path.length!==2||c.path[0]!=='fix'||!c.before.exists||!c.after.exists||!object(c.before.value)||!object(c.after.value)||canonical(c.after.value)===undefined){out.push(c);continue;}
+   const b=c.before.value,a=c.after.value,keys=Array.from(new Set(Object.keys(b).concat(Object.keys(a))));
+   const slotChanged=['slot','slotUser'].some(k=>!same(value(b,[k]),value(a,[k])));
+   for(const key of keys){if(same(value(b,[key]),value(a,[key])))continue;
+    const projected=Object.assign({},c,{path:c.path.concat(key),before:value(b,[key]),after:value(a,[key]),parentRequired:true});
+    if(slotChanged&&(key==='slot'||key==='slotUser'))projected.slotGuard={before:value(b,[key==='slot'?'slotUser':'slot']),after:value(a,[key==='slot'?'slotUser':'slot']),key:key==='slot'?'slotUser':'slot'};
+    out.push(projected);
+   }
+  }return out;
+ }
+ function parentPresent(root,c){if(!c.parentRequired)return true;const p=value(root,c.path.slice(0,-1));return p.exists&&p.value&&typeof p.value==='object'&&!Array.isArray(p.value);}
+ function verifiedChange(root,saved,c){return parentPresent(root,c)&&same(c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(root,c.path),c.after);}
  function apply(remote,intent,overlay){
   if(!intent||intent.version!==1||intent.kind!=='explicit-shared-input'||!Array.isArray(intent.changes))throw error('INVALID_SHARED_INTENT');
   const out=clone(remote||{}),saved=options.savedToMap(out.saved||[]),todo=[];
   // Complete validation pass before any changes. Unknown remote fields remain exact.
-  intent.changes.forEach(c=>{
+  intentChanges(intent).forEach(c=>{
    const current=c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(out,c.path);
+   if(!overlay&&(!parentPresent(out,c)||(c.slotGuard&&!same(value(out,c.path.slice(0,-1).concat(c.slotGuard.key)),c.slotGuard.before)&&!same(value(out,c.path.slice(0,-1).concat(c.slotGuard.key)),c.slotGuard.after)))){const e=error('SHARED_CONFLICT');e.details=[{path:clone(c.path),reason:'menu-parent-or-slot-changed'}];throw e;}
    if(same(current,c.after))return;
    if(!overlay&&!same(current,c.before)){const e=error('SHARED_CONFLICT');e.details=[{path:clone(c.path),before:clone(c.before),after:clone(c.after),current:clone(current)}];throw e;}
    todo.push(c);
@@ -1190,6 +1209,9 @@ function createSharedJournalCore(options){
  let blocked=[];
  const planOnly=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>Array.isArray(c.path)&&c.path.length===3&&c.path[0]==='plan'&&c.path.every(k=>typeof k==='string'&&k.length>0));
  const overlaps=(a,b)=>a.slice(0,Math.min(a.length,b.length)).every((v,i)=>v===b[i]);
+ const independentlyMergeable=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>(c.path[0]==='plan'&&c.path.length===3)||(c.path[0]==='fix'&&c.path.length===2));
+ function dependencyPaths(r){return intentChanges(r.payload).flatMap(c=>c.slotGuard?[c.path,c.path.slice(0,-1).concat(c.slotGuard.key)]:[c.path]);}
+
  function pendingDetails(){return clone({pending:records,staged,blocked,failure:failed?{code:failed.code||failed.message||'SHARED_FAILED'}:null});}
  const journal=options.journal;
  async function prepare(){
@@ -1284,7 +1306,7 @@ function createSharedJournalCore(options){
     if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
     const proved=remoteAcks.get(record.id);
     if(proved&&proved.id===record.id&&proved.hash===record.hash){await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
-    const parents=deferred.filter(prior=>!planOnly(record)||!planOnly(prior)||record.payload.changes.some(c=>prior.payload.changes.some(p=>overlaps(c.path,p.path))));
+    const parents=deferred.filter(prior=>!independentlyMergeable(record)||!independentlyMergeable(prior)||dependencyPaths(record).some(c=>dependencyPaths(prior).some(p=>overlaps(c,p))));
     if(parents.length){deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'dependent',blockedBy:parents.map(p=>p.id),paths:clone(record.payload.changes.map(c=>c.path))});continue;}
     const result=await options.transaction(current=>{conflict=null;resolved=false;try{if(resolutionProof(current,record)){resolved=true;return current;}return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
     if(conflict){if(conflict.code!=='SHARED_CONFLICT')throw conflict;firstConflict=firstConflict||conflict;deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'conflict',blockedBy:[],paths:clone(record.payload.changes.map(c=>c.path)),details:clone(conflict.details||[])});continue;}
@@ -1292,7 +1314,7 @@ function createSharedJournalCore(options){
     if(!result.verifiedSnapshot||typeof result.verifiedSnapshot!=='object')throw error('SHARED_ACK_MISMATCH');
     const snapshot=result.verifiedSnapshot,saved=options.savedToMap(snapshot.saved||[]);
     if(resolved){if(!resolutionProof(snapshot,record))throw error('SHARED_ACK_MISMATCH');retireResolved(snapshot);continue;}
-    if(!record.payload.changes.every(c=>same(c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(snapshot,c.path),c.after)))throw error('SHARED_ACK_MISMATCH');
+    if(!intentChanges(record.payload).every(c=>verifiedChange(snapshot,saved,c)))throw error('SHARED_ACK_MISMATCH');
     remoteAcks.set(record.id,{id:record.id,hash:record.hash,payload:record.payload,state:'server-acked'});
     await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);
     if(options.onAck)options.onAck(record,result);
