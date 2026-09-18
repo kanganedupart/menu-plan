@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260918_shared_menu_fields'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260918_authoritative_shared_sync'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -847,12 +847,14 @@ function confirmedWeekHasMenu(rec,name){
 }
 function resetConfirmedAfterFoodEdit(prev){
   if(!prev||!S.confirmed)return;
+  // Firebase omits empty cells; rebuilding those blanks is not a food edit.
+  const foodValue=v=>{if(v==null)return undefined;if(typeof v==='object'){const out={};Object.keys(v).sort().forEach(k=>{const child=foodValue(v[k]);if(child!==undefined)out[k]=child;});return Object.keys(out).length?out:undefined;}return v;};
   const dates={},menus={};
   const planKeys={};Object.assign(planKeys,statePlanKeys(S.plan),statePlanKeys(prev.plan));
   Object.keys(planKeys).forEach(k=>{
     const split=k.indexOf('|'),date=k.slice(0,split),meal=k.slice(split+1);
     if(date==='__stock__')return;
-    if(!stateSame(((S.plan[date]||{})[meal]),((prev.plan[date]||{})[meal])))dates[date]=1;
+    if(!stateSame(foodValue((S.plan[date]||{})[meal]),foodValue((prev.plan[date]||{})[meal])))dates[date]=1;
   });
   const fixKeys={};Object.keys(S.fix||{}).forEach(k=>fixKeys[k]=1);Object.keys(prev.fix||{}).forEach(k=>fixKeys[k]=1);
   const printedFix=v=>({slot:String((v||{}).slot||''),alg:String((v||{}).alg||'')});
@@ -1182,6 +1184,40 @@ function createSharedJournalCore(options){
  }
  function parentPresent(root,c){if(!c.parentRequired)return true;const p=value(root,c.path.slice(0,-1));return p.exists&&p.value&&typeof p.value==='object'&&!Array.isArray(p.value);}
  function verifiedChange(root,saved,c){return parentPresent(root,c)&&same(c.path[0]==='savedItems'?value(saved,[c.path[1]]):value(root,c.path),c.after);}
+
+ function confirmationDates(c){
+  if(c.path.length!==2||c.path[0]!=='confirmed'||!/^\d{4}-\d{2}-\d{2}$/.test(c.path[1]))return null;
+  const date=new Date(c.path[1]+'T00:00:00Z');if(!Number.isFinite(date.getTime())||date.toISOString().slice(0,10)!==c.path[1])return null;
+  if(c.after.exists&&(!c.after.value||c.after.value.start!==c.path[1]||!c.after.value.data||typeof c.after.value.data!=='object'||Array.isArray(c.after.value.data)))return null;
+  return Array.from({length:7},(_,i)=>new Date(date.getTime()+i*86400000).toISOString().slice(0,10));
+ }
+ function confirmationReads(intent){
+  const paths=[];for(const c of intent.changes){const dates=confirmationDates(c);if(!dates)continue;
+   const snapshot=c.after.exists?intent.after:intent.before,names=new Set();
+   for(const date of dates)for(const meal of ['조식','점심','저녁']){
+    paths.push(['plan',date,meal]);const cell=((snapshot.plan||{})[date]||{})[meal];
+    for(const item of cell&&cell.items||[]){const n=typeof item==='string'?item:item.n;if(n)names.add(n);}
+   }
+   for(const n of names)for(const field of ['alg','slot','slotUser'])paths.push(['fix',n,field]);
+  }return paths;
+ }
+ function confirmationValue(root,path){
+  if(path[0]!=='fix')return value(root,path);
+  const defaults=(options.menuDefaults||{})[path[1]],current=value(root,path);
+  if(defaults&&own(defaults,path[2])&&(path[2]==='slot'||!current.exists))return {exists:true,value:clone(defaults[path[2]])};
+  return current;
+ }
+ function verifyConfirmations(out,intent){
+  for(const c of intent.changes){const dates=confirmationDates(c);if(!dates||!c.after.exists)continue;
+   const one=Object.assign({},intent,{changes:[c]});
+   for(const path of confirmationReads(one)){if(!same(confirmationValue(out,path),confirmationValue(intent.after,path))){const e=error('SHARED_CONFLICT');e.details=[{path:clone(path),reason:'confirmation-source-changed'}];throw e;}}
+   const data=c.after.value.data;
+   for(const date of dates)for(const meal of ['조식','점심','저녁']){
+    const cell=((intent.after.plan||{})[date]||{})[meal],names=(cell&&cell.items||[]).map(x=>typeof x==='string'?x:x.n).filter(Boolean).sort();
+    const confirmed=(((data||{})[date]||{})[meal]||[]);if(!Array.isArray(confirmed)||!same(names,confirmed.slice().sort()))throw error('SHARED_CONFLICT');
+   }
+  }
+ }
  function apply(remote,intent,overlay){
   if(!intent||intent.version!==1||intent.kind!=='explicit-shared-input'||!Array.isArray(intent.changes))throw error('INVALID_SHARED_INTENT');
   const out=clone(remote||{}),saved=options.savedToMap(out.saved||[]),todo=[];
@@ -1193,7 +1229,7 @@ function createSharedJournalCore(options){
    if(!overlay&&!same(current,c.before)){const e=error('SHARED_CONFLICT');e.details=[{path:clone(c.path),before:clone(c.before),after:clone(c.after),current:clone(current)}];throw e;}
    todo.push(c);
   });
-  if(!todo.length)return out;
+  if(!todo.length){if(!overlay)verifyConfirmations(out,intent);return out;}
   let rev=Math.max(Number(out._serverRev)||0,Number(options.stateMaxTs(out))||0);
   out._ts=out._ts||{};
   todo.forEach(c=>{
@@ -1202,6 +1238,7 @@ function createSharedJournalCore(options){
   });
   if(todo.some(c=>c.path[0]==='savedItems')){out.saved=options.savedFromMap(saved,out.saved||[]);out._ts.saved=rev;}
   out._serverRev=rev;out.updatedAt=Math.max(Number(out.updatedAt)||0,rev);
+  if(!overlay)verifyConfirmations(out,intent);
   return out;
  }
  let ready=null,failed=null,inflight=null,tail=Promise.resolve(),records=[],staged=[];
@@ -1209,9 +1246,15 @@ function createSharedJournalCore(options){
  let blocked=[];
  const planOnly=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>Array.isArray(c.path)&&c.path.length===3&&c.path[0]==='plan'&&c.path.every(k=>typeof k==='string'&&k.length>0));
  const overlaps=(a,b)=>a.slice(0,Math.min(a.length,b.length)).every((v,i)=>v===b[i]);
- const independentlyMergeable=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>(c.path[0]==='plan'&&c.path.length===3)||(c.path[0]==='fix'&&c.path.length===2));
+ const independentlyMergeable=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>(c.path[0]==='plan'&&c.path.length===3)||(c.path[0]==='fix'&&c.path.length===2)||!!confirmationDates(c));
  function dependencyPaths(r){return intentChanges(r.payload).flatMap(c=>c.slotGuard?[c.path,c.path.slice(0,-1).concat(c.slotGuard.key)]:[c.path]);}
 
+ function recordsDepend(record,prior){
+  if(!independentlyMergeable(record)||!independentlyMergeable(prior))return true;
+  const w=dependencyPaths(record),pw=dependencyPaths(prior),r=confirmationReads(record.payload),pr=confirmationReads(prior.payload);
+  const intersects=(a,b)=>a.some(x=>b.some(y=>overlaps(x,y)));
+  return intersects(w,pw)||intersects(r,pw)||intersects(w,pr);
+ }
  function pendingDetails(){return clone({pending:records,staged,blocked,failure:failed?{code:failed.code||failed.message||'SHARED_FAILED'}:null});}
  const journal=options.journal;
  async function prepare(){
@@ -1306,7 +1349,7 @@ function createSharedJournalCore(options){
     if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
     const proved=remoteAcks.get(record.id);
     if(proved&&proved.id===record.id&&proved.hash===record.hash){await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
-    const parents=deferred.filter(prior=>!independentlyMergeable(record)||!independentlyMergeable(prior)||dependencyPaths(record).some(c=>dependencyPaths(prior).some(p=>overlaps(c,p))));
+    const parents=deferred.filter(prior=>recordsDepend(record,prior));
     if(parents.length){deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'dependent',blockedBy:parents.map(p=>p.id),paths:clone(record.payload.changes.map(c=>c.path))});continue;}
     const result=await options.transaction(current=>{conflict=null;resolved=false;try{if(resolutionProof(current,record)){resolved=true;return current;}return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
     if(conflict){if(conflict.code!=='SHARED_CONFLICT')throw conflict;firstConflict=firstConflict||conflict;deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'conflict',blockedBy:[],paths:clone(record.payload.changes.map(c=>c.path)),details:clone(conflict.details||[])});continue;}
@@ -1337,7 +1380,7 @@ const sharedInputJournal=createBareunOperationJournal({namespace:'shared-menu'})
 const sharedInputArchive=createBareunBackupArchive();
 const sharedResolutionJournal=createBareunOperationJournal({namespace:'shared-menu-resolutions'});
 const sharedInputCore=createSharedJournalCore({
- journal:sharedInputJournal,resolutions:sharedResolutionJournal,savedToMap,savedFromMap,stateMaxTs,
+ journal:sharedInputJournal,resolutions:sharedResolutionJournal,savedToMap,savedFromMap,stateMaxTs,menuDefaults:CORE_MENU_FIX,
  randomId:()=>crypto.randomUUID(),
  onError:e=>{setSyncBadge('warn','입력 보관 실패 · 창을 닫지 마세요');showSaveProblem(e)},
  archiveLegacy:async()=>{
@@ -1361,7 +1404,7 @@ const sharedInputCore=createSharedJournalCore({
 });
 function sharedOverlayRemote(remote){return sharedInputCore.overlay(remote||{});}
 function sharedMergeRemote(remote,keepStart){
- const overlaid=sharedOverlayRemote(remote);mergeRemoteState(overlaid,keepStart);
+ const overlaid=sharedOverlayRemote(remote);applyRemoteState(overlaid,keepStart);
  S.mealNotes=stateClone(overlaid.mealNotes||{});S.excludedMeals=stateClone(overlaid.excludedMeals||{});
  sharedJournalBaseline=stateClone(S);
 }
