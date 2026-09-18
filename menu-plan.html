@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260918_authoritative_shared_sync'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20260918_shared_scope_verified'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -845,31 +845,32 @@ function confirmedWeekHasMenu(rec,name){
     return list.some(item=>String(typeof item==='string'?item:(item&&item.n)||'')===String(name));
   }));
 }
+let confirmationEditProof={};
+let confirmationViewDefaults={};
 function resetConfirmedAfterFoodEdit(prev){
+  confirmationEditProof={};
   if(!prev||!S.confirmed)return;
   // Firebase omits empty cells; rebuilding those blanks is not a food edit.
   const foodValue=v=>{if(v==null)return undefined;if(typeof v==='object'){const out={};Object.keys(v).sort().forEach(k=>{const child=foodValue(v[k]);if(child!==undefined)out[k]=child;});return Object.keys(out).length?out:undefined;}return v;};
-  const dates={},menus={};
+  const dates={};
+  const mealValue=cell=>((cell&&cell.items)||[]);
   const planKeys={};Object.assign(planKeys,statePlanKeys(S.plan),statePlanKeys(prev.plan));
   Object.keys(planKeys).forEach(k=>{
     const split=k.indexOf('|'),date=k.slice(0,split),meal=k.slice(split+1);
     if(date==='__stock__')return;
-    if(!stateSame(foodValue((S.plan[date]||{})[meal]),foodValue((prev.plan[date]||{})[meal])))dates[date]=1;
+    if(!stateSame(foodValue(mealValue((S.plan[date]||{})[meal])),foodValue(mealValue((prev.plan[date]||{})[meal]))))dates[date]=1;
   });
-  const fixKeys={};Object.keys(S.fix||{}).forEach(k=>fixKeys[k]=1);Object.keys(prev.fix||{}).forEach(k=>fixKeys[k]=1);
-  const printedFix=v=>({slot:String((v||{}).slot||''),alg:String((v||{}).alg||'')});
-  Object.keys(fixKeys).forEach(name=>{if(!stateSame(printedFix((S.fix||{})[name]),printedFix((prev.fix||{})[name])))menus[name]=1;});
   ['mealEvents','lunchboxDates'].forEach(kind=>{
     const keys={};Object.keys(S[kind]||{}).forEach(k=>keys[k]=1);Object.keys(prev[kind]||{}).forEach(k=>keys[k]=1);
     Object.keys(keys).forEach(k=>{if(!stateSame((S[kind]||{})[k],(prev[kind]||{})[k]))dates[String(k).split('|')[0]]=1;});
   });
-  if(!Object.keys(dates).length&&!Object.keys(menus).length)return;
+  if(!Object.keys(dates).length)return;
   const at=nowStamp();
   Object.keys(S.confirmed).forEach(ws=>{
     const rec=S.confirmed[ws];
-    const affected=Object.keys(dates).some(date=>confirmedWeekHasDate(rec,date))
-      ||Object.keys(menus).some(name=>confirmedWeekHasMenu(rec,name));
+    const affected=Object.keys(dates).some(date=>confirmedWeekHasDate(rec,date));
     if(!affected)return;
+    confirmationEditProof[ws]=Object.keys(dates).filter(date=>confirmedWeekHasDate(rec,date));
     delete S.confirmed[ws];
     S._ts.confirmed[ws]=at;
     dirtyMark('confirmed',ws);
@@ -1220,6 +1221,22 @@ function createSharedJournalCore(options){
  }
  function apply(remote,intent,overlay){
   if(!intent||intent.version!==1||intent.kind!=='explicit-shared-input'||!Array.isArray(intent.changes))throw error('INVALID_SHARED_INTENT');
+  if(!overlay){
+   const removals=intent.changes.filter(c=>c.path[0]==='confirmed'&&!c.after.exists);
+   if(removals.length){
+    const command=intent.dirty&&intent.dirty.confirmationCommand;
+    const explicit=command&&command.version===1&&command.action==='cancel'&&removals.length===1&&removals[0].path[1]===command.week;
+    const evidence=intent.dirty&&intent.dirty.confirmedEditDates;
+    const dated=removals.every(removal=>{
+     const dates=evidence&&evidence[removal.path[1]],week=confirmationDates(removal);
+     return Array.isArray(dates)&&dates.length>0&&week&&dates.every(date=>week.includes(date)&&intent.changes.some(change=>{
+      if(change.path[0]==='plan'&&change.path[1]===date)return !same((change.before.value||{}).items||[],(change.after.value||{}).items||[]);
+      return ['mealEvents','lunchboxDates'].includes(change.path[0])&&String(change.path[1]).split('|')[0]===date&&!same(change.before,change.after);
+     }));
+    });
+    if(!explicit&&!dated){const e=error('SHARED_CONFLICT');e.details=removals.map(c=>({path:clone(c.path),reason:'legacy-confirmation-deletion-held'}));throw e;}
+   }
+  }
   const out=clone(remote||{}),saved=options.savedToMap(out.saved||[]),todo=[];
   // Complete validation pass before any changes. Unknown remote fields remain exact.
   intentChanges(intent).forEach(c=>{
@@ -1244,6 +1261,7 @@ function createSharedJournalCore(options){
  let ready=null,failed=null,inflight=null,tail=Promise.resolve(),records=[],staged=[];
  const remoteAcks=new Map();
  let blocked=[];
+ let quarantined=[];
  const planOnly=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>Array.isArray(c.path)&&c.path.length===3&&c.path[0]==='plan'&&c.path.every(k=>typeof k==='string'&&k.length>0));
  const overlaps=(a,b)=>a.slice(0,Math.min(a.length,b.length)).every((v,i)=>v===b[i]);
  const independentlyMergeable=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>(c.path[0]==='plan'&&c.path.length===3)||(c.path[0]==='fix'&&c.path.length===2)||!!confirmationDates(c));
@@ -1255,11 +1273,39 @@ function createSharedJournalCore(options){
   const intersects=(a,b)=>a.some(x=>b.some(y=>overlaps(x,y)));
   return intersects(w,pw)||intersects(r,pw)||intersects(w,pr);
  }
- function pendingDetails(){return clone({pending:records,staged,blocked,failure:failed?{code:failed.code||failed.message||'SHARED_FAILED'}:null});}
+ function pendingDetails(){return clone({pending:records,staged,blocked,quarantined,failure:failed?{code:failed.code||failed.message||'SHARED_FAILED'}:null});}
+ function legacyConfirmationRemoval(record){
+  const p=record.payload,d=p.dirty||{};
+  return p.changes.some(c=>c.path[0]==='confirmed'&&!c.after.exists)&&!d.confirmationCommand&&!d.confirmedEditDates;
+ }
+ async function quarantineLegacyInputs(){
+  const legacy=records.filter(legacyConfirmationRemoval);if(!legacy.length&&!options.quarantines)return;
+  if(!options.quarantines)throw error('QUARANTINE_STORE_UNAVAILABLE');
+  const prior=await options.quarantines.pending(),marked=new Map();
+  for(const row of prior){const p=row.payload;if(p.version!==1||p.kind!=='preserved-legacy-input'||!p.original)throw error('INVALID_QUARANTINE_MANIFEST');marked.set(p.original.id,p.original.hash);}
+  const selected=new Set(records.filter(r=>legacyConfirmationRemoval(r)||marked.has(r.id)).map(r=>r.id));
+  // Preserve each connected old history as a whole, including preceding canceled
+  // confirmation attempts. Never cherry-pick menu/allergy fields from an old input.
+  let expanded=true;while(expanded){expanded=false;for(const r of records){if(selected.has(r.id)||r.payload.dirty&&(r.payload.dirty.confirmationCommand||Object.prototype.hasOwnProperty.call(r.payload.dirty,'confirmedEditDates')))continue;if(records.some(q=>selected.has(q.id)&&recordsDepend(r,q))){selected.add(r.id);expanded=true;}}}
+  const kept=records.filter(r=>selected.has(r.id));
+  for(const r of kept){
+   const original=await journal.get(r.id);if(!original||original.id!==r.id||original.hash!==r.hash)throw error('SHARED_JOURNAL_MISMATCH');
+   if(!options.archivePreserved||await options.archivePreserved(original)!==r.hash)throw error('QUARANTINE_ARCHIVE_VERIFY_FAILED');
+   if(original.state==='acked'){records=records.filter(x=>x.id!==r.id);selected.delete(r.id);continue;}
+   if(original.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
+   if(marked.has(r.id)){if(marked.get(r.id)!==r.hash)throw error('QUARANTINE_HASH_MISMATCH');continue;}
+   const manifest=await options.quarantines.put('preserved_'+r.id,{version:1,kind:'preserved-legacy-input',original:{id:r.id,hash:r.hash},reason:legacyConfirmationRemoval(r)?'unscoped-confirmation-removal':'connected-legacy-history',disposition:'preserved-not-published',at:Date.now()},{retainAcknowledged:true});
+   const verified=await options.quarantines.get(manifest.id);if(verified.hash!==manifest.hash||verified.payload.original.id!==r.id||verified.payload.original.hash!==r.hash)throw error('QUARANTINE_VERIFY_FAILED');
+   marked.set(r.id,r.hash);
+  }
+  // Only remove from the active in-memory queue after every manifest is durable.
+  quarantined=kept.filter(r=>selected.has(r.id)).map(r=>({id:r.id,hash:r.hash,disposition:'preserved-not-published'}));
+  records=records.filter(r=>!selected.has(r.id));
+ }
  const journal=options.journal;
  async function prepare(){
   if(ready)return ready;
-  ready=(async()=>{await options.archiveLegacy();records=await journal.pending();for(const r of records)apply({},r.payload,true);return true;})();
+  ready=(async()=>{await options.archiveLegacy();records=await journal.pending();await quarantineLegacyInputs();for(const r of records)apply({},r.payload,true);return true;})();
   ready.catch(e=>{failed=e;});return ready;
  }
  function enqueue(before,after,dirty){
@@ -1277,7 +1323,13 @@ function createSharedJournalCore(options){
   return !!(link&&link.hash===record.hash&&proof&&proof.hash===link.resolutionHash&&proof.originals&&proof.originals[record.id]===record.hash);
  }
  function retireResolved(remote){
-  const resolved=new Set(records.filter(r=>resolutionProof(remote||{},r)).map(r=>r.id));
+  const resolved=new Set(records.filter(r=>resolutionProof(remote||{},r)).map(r=>{
+   const link=remote._sharedResolvedInputs[r.id];
+   // Receipt proves this input was superseded by the verified final intent;
+   // it does not claim every intermediate value was individually published.
+   remoteAcks.set(r.id,{id:r.id,hash:r.hash,payload:r.payload,state:'server-resolved',resolutionId:link.resolutionId,resolutionHash:link.resolutionHash});
+   return r.id;
+  }));
   records=records.filter(r=>!resolved.has(r.id));blocked=blocked.filter(r=>!resolved.has(r.id));
  }
  async function resolutionPreview(remote){
@@ -1337,10 +1389,78 @@ function createSharedJournalCore(options){
  }
 
  function overlay(remote){retireResolved(remote||{});let out=clone(remote||{});for(const record of records)out=apply(out,record.payload,true);for(const item of staged)out=apply(out,item.payload,true);return out;}
+
+ // Retire only continuous local histories whose repeated edits can be reduced
+ // to one final CAS. Intermediate inputs stay durable and linked by hashes.
+ function continuousChainIntent(batch){
+  if(batch.length<2||batch.length>32||!batch.every(independentlyMergeable))return null;
+  const paths=new Map();let after=clone(batch[0].payload.before),repeated=false;
+  for(const record of batch){
+   for(const c of intentChanges(record.payload)){
+    const key=JSON.stringify(c.path);
+    // A parent replacement followed by a child edit needs a distinct migration;
+    // do not guess how to combine newly-created menu schemas.
+    if([...paths.values()].some(p=>JSON.stringify(p.path)!==key&&overlaps(p.path,c.path)))return null;
+    if(!same(value(after,c.path),c.before))return null;
+    const prior=paths.get(key);
+    if(prior){prior.after=clone(c.after);if(prior.slotGuard&&c.slotGuard&&prior.slotGuard.key===c.slotGuard.key)prior.slotGuard.after=clone(c.slotGuard.after);repeated=true;}
+    else paths.set(key,clone(c));
+    change(after,c.path,c.after);
+   }
+  }
+  if(!repeated)return null;
+  const dirty={confirmedEditDates:Object.assign({},...batch.map(r=>r.payload.dirty&&r.payload.dirty.confirmedEditDates||{}))};
+  const removals=[...paths.values()].filter(c=>c.path[0]==='confirmed'&&!c.after.exists&&!same(c.before,c.after));
+  if(removals.length===1){const ws=removals[0].path[1],author=batch.slice().reverse().find(r=>r.payload.dirty&&r.payload.dirty.confirmationCommand&&r.payload.dirty.confirmationCommand.action==='cancel'&&r.payload.dirty.confirmationCommand.week===ws);if(author)dirty.confirmationCommand=clone(author.payload.dirty.confirmationCommand);}
+  return {version:1,kind:'explicit-shared-input',before:clone(batch[0].payload.before),after,
+   dirty,changes:[...paths.values()].filter(c=>!same(c.before,c.after)||(c.path[0]==='confirmed'&&c.after.exists)),at:Date.now(),noOpGuards:[...paths.values()].filter(c=>same(c.before,c.after)).map(c=>({path:clone(c.path),expected:clone(c.after)}))};
+ }
+ async function drainContinuousChains(){
+  // A bounded prefix preserves ordering against every remaining record.
+  // Shorter prefixes may free a completed local chain without touching a
+  // genuinely conflicting later allergy edit.
+  // Another tab can acknowledge an input after this tab's in-memory prepare.
+  // Match normal drain: validate identity first, then omit an already ACKed row.
+  for(const r of records.slice(0,32)){
+   const durable=await journal.get(r.id);
+   if(!durable||durable.id!==r.id||durable.hash!==r.hash)throw error('SHARED_JOURNAL_MISMATCH');
+   if(durable.state==='acked'){records=records.filter(x=>x.id!==r.id);continue;}
+   if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
+  }
+  const available=records.slice(0,32);
+  const eligible=[];
+  for(let count=available.length;count>=2;count--){const batch=available.slice(0,count),intent=continuousChainIntent(batch);if(intent)eligible.push({batch,intent});}
+  // Root transactions are expensive. Try at most the broadest continuous
+  // prefix and the smallest useful prefix, never one request per old edit.
+  const attempts=eligible.length>1?[eligible[0],eligible[eligible.length-1]]:eligible;
+  for(const {batch,intent} of attempts){
+   for(const r of batch){const durable=await journal.get(r.id);if(!durable||durable.id!==r.id||durable.hash!==r.hash)throw error('SHARED_JOURNAL_MISMATCH');if(durable.state==='acked'){records=records.filter(x=>x.id!==r.id);return false;}if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');}
+   const resolutionId='shared_coalesced_'+options.randomId(),proofHash=JSON.stringify(batch.map(r=>[r.id,r.hash]));
+   let issue=null;
+   const result=await options.transaction(remote=>{issue=null;try{
+    const retired=batch.filter(r=>resolutionProof(remote,r)).length;
+    if(retired===batch.length)return remote;
+    if(retired)throw error('SHARED_CONFLICT');
+    // No-op paths still carry explicit final intent. A different published
+    // confirmation or allergy must never be silently retired as synchronized.
+    for(const g of intent.noOpGuards)if(!same(value(remote,g.path),g.expected))throw error('SHARED_CONFLICT');
+    const out=apply(remote,intent,false),originals={};
+    out._sharedResolutions=out._sharedResolutions||{};out._sharedResolvedInputs=out._sharedResolvedInputs||{};
+    for(const r of batch){originals[r.id]=r.hash;out._sharedResolvedInputs[r.id]={hash:r.hash,resolutionId,resolutionHash:proofHash};}
+    out._sharedResolutions[resolutionId]={hash:proofHash,originals,choice:'continuous-local-chain'};
+    return out;
+   }catch(e){issue=e;return undefined;}});
+   if(issue){if(issue.code==='SHARED_CONFLICT')continue;throw issue;}
+   if(!result||!result.committed||!result.verifiedSnapshot||!batch.every(r=>resolutionProof(result.verifiedSnapshot,r)))throw error('SHARED_ACK_MISMATCH');
+   retireResolved(result.verifiedSnapshot);return true;
+  }
+  return false;
+ }
+
  async function drain(){
   if(inflight)return inflight;
   inflight=(async()=>{await prepare();await tail;if(failed)throw failed;
-   await drainResolutions();blocked=[];const deferred=[],seen=new Set();let firstConflict=null;
+   await drainResolutions();await drainContinuousChains();blocked=[];const deferred=[],seen=new Set();let firstConflict=null;
    while(true){await tail;if(failed)throw failed;const batch=records.filter(r=>!seen.has(r.id));if(!batch.length)break;
    for(const record of batch){seen.add(record.id);let conflict=null,resolved=false;
     const durable=await journal.get(record.id);
@@ -1369,7 +1489,7 @@ function createSharedJournalCore(options){
   try{return await inflight;}finally{inflight=null;}
  }
 
- return {prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
+ return {prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),isQuarantined:r=>quarantined.some(q=>q.id===r.id&&q.hash===r.hash),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
 }
 
 let sharedJournalBaseline=stateClone(S),sharedJournalReady=false;
@@ -1379,8 +1499,14 @@ sharedConnectionReady.catch(()=>{});
 const sharedInputJournal=createBareunOperationJournal({namespace:'shared-menu'});
 const sharedInputArchive=createBareunBackupArchive();
 const sharedResolutionJournal=createBareunOperationJournal({namespace:'shared-menu-resolutions'});
+const sharedQuarantineJournal=createBareunOperationJournal({namespace:'shared-menu-preserved-inputs'});
 const sharedInputCore=createSharedJournalCore({
- journal:sharedInputJournal,resolutions:sharedResolutionJournal,savedToMap,savedFromMap,stateMaxTs,menuDefaults:CORE_MENU_FIX,
+ journal:sharedInputJournal,resolutions:sharedResolutionJournal,quarantines:sharedQuarantineJournal,savedToMap,savedFromMap,stateMaxTs,menuDefaults:CORE_MENU_FIX,
+ archivePreserved:async record=>{
+  const raw=JSON.stringify(record.payload),saved=await sharedInputArchive.archiveRaw(raw,'preserved-input:'+record.id);
+  if(!saved.verified||saved.sha256!==record.hash||await sharedInputArchive.exportRaw(saved.sha256)!==raw)throw new Error('이전 입력 원문 보존 확인 실패');
+  return saved.sha256;
+ },
  randomId:()=>crypto.randomUUID(),
  onError:e=>{setSyncBadge('warn','입력 보관 실패 · 창을 닫지 마세요');showSaveProblem(e)},
  archiveLegacy:async()=>{
@@ -1411,7 +1537,7 @@ function sharedMergeRemote(remote,keepStart){
 async function sharedPrepare(){
  await sharedInputCore.prepare();
  const latest=await sharedInputJournal.latest();
- if(latest&&latest.payload&&latest.payload.kind==='explicit-shared-input'){
+ if(latest&&!sharedInputCore.isQuarantined(latest)&&latest.payload&&latest.payload.kind==='explicit-shared-input'){
   const keep=S.start;applyRemoteState(sharedOverlayRemote(latest.payload.after),keep);sharedJournalBaseline=stateClone(S);
  }
  sharedJournalReady=true;pendingRecoveryHold=false;return true;
@@ -1453,6 +1579,42 @@ function flushBeforeLeave(){
 
 let sharedUiSaveState='idle',sharedUiSaveNumber=0,sharedUiUndo=null,sharedUiMutationFrame=0;
 
+
+// A confirmation action owns one week. Do not sweep unrelated view/metadata changes.
+function prepareWeekConfirmation(before,current,ws){
+ if(!/^\d{4}-\d{2}-\d{2}$/.test(ws))throw new Error('Invalid confirmation week');
+ const after=stateClone(before);after.confirmed=after.confirmed||{};
+ const record=(current.confirmed||{})[ws],dates=[],names=new Set();
+ if(record){
+  after.confirmed[ws]=stateClone(record);after.plan=after.plan||{};after.fix=after.fix||{};
+  for(let i=0;i<7;i++){
+   const d=addDays(ws,i);dates.push(d);
+   if(Object.prototype.hasOwnProperty.call(current.plan||{},d))after.plan[d]=stateClone(current.plan[d]);else delete after.plan[d];
+   for(const meal of ['조식','점심','저녁'])for(const it of (((current.plan||{})[d]||{})[meal]||{}).items||[])names.add(typeof it==='string'?it:it.n);
+  }
+  for(const name of names){if(Object.prototype.hasOwnProperty.call(current.fix||{},name))after.fix[name]=stateClone(current.fix[name]);}
+ }else delete after.confirmed[ws];
+ return {before,after,ws,dates,names:Array.from(names)};
+}
+function saveWeekConfirmation(ws){
+ const uiNumber=++sharedUiSaveNumber;sharedUiSaveState='pending';sharedUiUndo=null;
+ const prepared=prepareWeekConfirmation(stateClone(sharedJournalBaseline),S,ws);
+ const durable=sharedInputCore.enqueue(prepared.before,prepared.after,{confirmationCommand:{version:1,week:ws,action:S.confirmed[ws]?'confirm':'cancel'}});
+ sharedJournalBaseline=stateClone(prepared.after);
+ // Advance only fields captured in this durable command, not the whole UI state.
+ if(STATE_LAST){
+  STATE_LAST.confirmed=STATE_LAST.confirmed||{};
+  if(S.confirmed[ws])STATE_LAST.confirmed[ws]=stateClone(S.confirmed[ws]);else delete STATE_LAST.confirmed[ws];
+  for(const d of prepared.dates){STATE_LAST.plan=STATE_LAST.plan||{};if(S.plan[d])STATE_LAST.plan[d]=stateClone(S.plan[d]);else delete STATE_LAST.plan[d];}
+  for(const name of prepared.names){if(Object.prototype.hasOwnProperty.call(S.fix||{},name)){STATE_LAST.fix=STATE_LAST.fix||{};STATE_LAST.fix[name]=stateClone(S.fix[name]);}}
+ }
+ setSyncBadge('busy','입력 보관 중');
+ const completion=durable.then(sharedWaitForAck);
+ completion.then(result=>{if(uiNumber===sharedUiSaveNumber)sharedUiSaveState=result.ok?'saved':'idle';},()=>{if(uiNumber===sharedUiSaveNumber)sharedUiSaveState='failed';});
+ completion.catch(error=>{showSaveProblem(error);setSyncBadge('warn','공유 확인 필요 · 입력은 유지됩니다');});
+ return completion;
+}
+
 const save=()=>{
  const uiNumber=++sharedUiSaveNumber;sharedUiSaveState='pending';sharedUiUndo=null;sharedUiMutationFrame=uiNumber;Promise.resolve().then(()=>{if(sharedUiMutationFrame===uiNumber)sharedUiMutationFrame=0;});
  const before=stateClone(sharedJournalBaseline);
@@ -1461,7 +1623,11 @@ const save=()=>{
  stateStampDiff();
  if(!FB_ON||fbReady)stateRepairMissingTs(S,Date.now());else stateEnsureShape(S);
  lastLocalSave=Date.now();S.planLogicVer=PLAN_LOGIC_VER;S.updatedAt=nowStamp();dirtyMark('meta');
- const after=stateClone(S),dirty=stateClone(DIRTY);
+ const after=stateClone(S),dirty=stateClone(DIRTY);dirty.confirmedEditDates=stateClone(confirmationEditProof);
+ // Viewing a missing date in an already-confirmed week must not restore it as a side effect.
+ for(const d of Object.keys(confirmationViewDefaults)){
+  if(!Object.prototype.hasOwnProperty.call(before.plan||{},d)&&stateSame(after.plan[d],confirmationViewDefaults[d]))delete after.plan[d];
+ }
  const durable=sharedInputCore.enqueue(before,after,dirty);
  sharedJournalBaseline=stateClone(after);dirtyReset();
  setSyncBadge('busy','입력 보관 중');
@@ -1729,6 +1895,7 @@ function preserveEmptyMeal(date,meal){
 }
 function buildPeriod(start,options){
   const forceRef=!!(options&&options.explicitRefReset);
+  const generatedDates=[];
   const usedMains=new Set();
   // 이미 손대지 않은(자동) 날만 새로 채우되, 그 주에 쓰인 메인을 누적해 중복 회피
   periodDates(start).forEach(d=>{
@@ -1737,6 +1904,8 @@ function buildPeriod(start,options){
       ['점심','저녁'].forEach(m=>{const mn=mealMainName(((S.plan[d][m]&&S.plan[d][m].items)||[]).map(it=>it.n));if(mn)usedMains.add(mn);});
       return;
     }
+    generatedDates.push(d);
+    if(forceRef)delete confirmationViewDefaults[d];
     const keepEmpty=meal=>!forceRef&&preserveEmptyMeal(d,meal);
     // 그 날짜 자체에 실제 과거 기록이 있으면(예: 직접 넣은 6/15 주) 그걸 그대로 사용
     if(BYDAY[d]&&((BYDAY[d]['점심']||[]).length||(BYDAY[d]['저녁']||[]).length)){
@@ -1760,6 +1929,12 @@ function buildPeriod(start,options){
       if(!S.plan[sun][meal])S.plan[sun][meal]={items:[]};   // 비워둠 (이미 적은 건 보존)
     });
   });
+  // Generated display defaults are not a user edit; keep the comparison checkpoint aligned.
+  // The journal baseline is deliberately untouched: a later explicit confirmation must save its week.
+  if(!forceRef&&STATE_LAST){STATE_LAST.plan=STATE_LAST.plan||{};for(const d of generatedDates){
+   STATE_LAST.plan[d]=stateClone(S.plan[d]);
+   if(Object.values(S.confirmed||{}).some(rec=>confirmedWeekHasDate(rec,d)))confirmationViewDefaults[d]=stateClone(S.plan[d]);
+  }}
 }
 
 /* ===== 위험군 검사 ===== */
@@ -2753,6 +2928,7 @@ function restoreData(ev){
       const obj=JSON.parse(rd.result);
       if(!obj||typeof obj!=='object'||!('plan' in obj)){alert('이 파일은 바른식당 백업 파일이 아니에요.');return}
       if(!confirm('지금 식단을 백업 파일 내용으로 바꿀까요? (현재 작업은 사라집니다)'))return;
+      confirmationViewDefaults={};
       S=obj;S.plan=S.plan||{};S.confirmed=S.confirmed||{};S.skip=S.skip||[];S.saved=S.saved||[];
       S.planLogicVer=PLAN_LOGIC_VER;   // 버전만 갱신, 식단은 백업 그대로 보존
       save();render();
@@ -2769,7 +2945,7 @@ function confirmWeek(ws){
     stateEnsureShape(S);
     S._ts.confirmed[ws]=nowStamp();
     dirtyMark('confirmed',ws);
-    save();render();
+    saveWeekConfirmation(ws);render();
     toast(fmt(ws)+'~ 주 식단 확정을 해제했어요',false);
     return false;
   }
@@ -2790,7 +2966,7 @@ function confirmWeek(ws){
   S._ts.confirmed[ws]=nowStamp();
   dirtyMark('confirmed',ws);
   // 확정하면 누적 풀에도 반영
-  absorbPlan();save();render();
+  absorbPlan();saveWeekConfirmation(ws);render();
   toast(fmt(ws)+'~ 주 식단을 확정했어요',false);
   return true;
 }
