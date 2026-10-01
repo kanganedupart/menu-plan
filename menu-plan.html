@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20260918_shared_scope_verified'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261001_remote_snapshot_consume_v1'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -956,13 +956,30 @@ function applyRemoteState(remote,keepStart){
   applyFixesToMenu();
   STATE_LAST=stateSnapshot();
 }
+// Remote rendering must not replace a command between press and click.
+const sharedRemotePointers=new Set(),sharedRemoteKeys=new Set();
+let sharedRemoteApplyTimer=null;
+function schedulePendingRemoteApply(){
+ if(sharedRemoteApplyTimer!==null)clearTimeout(sharedRemoteApplyTimer);
+ sharedRemoteApplyTimer=setTimeout(()=>{sharedRemoteApplyTimer=null;applyPendingRemoteState();},0);
+}
+document.addEventListener('pointerdown',e=>{sharedRemotePointers.add(e.pointerId);},true);
+document.addEventListener('pointerup',e=>{sharedRemotePointers.delete(e.pointerId);schedulePendingRemoteApply();},true);
+document.addEventListener('pointercancel',e=>{sharedRemotePointers.delete(e.pointerId);schedulePendingRemoteApply();},true);
+document.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')sharedRemoteKeys.add(e.key);},true);
+document.addEventListener('keyup',e=>{if(e.key==='Enter'||e.key===' '){sharedRemoteKeys.delete(e.key);schedulePendingRemoteApply();}},true);
+window.addEventListener('blur',()=>{sharedRemotePointers.clear();sharedRemoteKeys.clear();});
+window.addEventListener('focus',schedulePendingRemoteApply);
+// A mouse release outside this document may not deliver pointerup here.
+document.addEventListener('pointermove',e=>{if(e.pointerType==='mouse'&&e.buttons===0&&sharedRemotePointers.delete(e.pointerId))schedulePendingRemoteApply();},true);
+document.addEventListener('focusout',schedulePendingRemoteApply);
 function menuEditing(){
   const _sh=document.getElementById('sheet'), _oov=document.getElementById('oov');
   const sheetOpen=!!(_sh&&_sh.classList.contains('on'));
   const orderOpen=!!(_oov&&_oov.classList.contains('on'));
   const ae=document.activeElement;
   const activeInput=!!(ae&&/TEXTAREA|INPUT/.test(ae.tagName)&&ae.offsetParent!==null);
-  return sheetOpen||orderOpen||activeInput;
+  return sharedRemotePointers.size>0||sharedRemoteKeys.size>0||sheetOpen||orderOpen||activeInput;
 }
 function applyPendingRemoteState(){
   if(!pendingRemoteState||menuEditing())return;
@@ -1691,13 +1708,9 @@ function initFirebase(){
         const remoteRepaired = stateRepairMissingTs(r,+r.updatedAt||Date.now());
         // 칸별 저장시각으로 병합한다. 전체 updatedAt만 보고 원격 데이터를 버리지 않는다.
         // 사용자가 수정 중이면(식단 모달 / 발주 모달 / 입력 포커스) 원격 적용 자체를 미룬다 — 작업 중인 식단이 덮어써지지 않게
-        if(menuEditing()){pendingRemoteState=r;return;}
-        fbApplying=true;
-        var _keepStart=S.start;
-        sharedMergeRemote(r,_keepStart);   // 보던 주는 각자 유지 — 원격이 다른 주로 끌고가 날짜가 뒤로 넘어가지 않게
-        try{void 0 /* old main-state raw preserved */}catch(e){}
-        fbApplying=false;
-        if(typeof render==='function'){buildPeriod(S.start);render()}
+        // Keep exactly the latest received snapshot. Every application consumes it.
+        pendingRemoteState=r;
+        applyPendingRemoteState();
       });
     }).catch((e)=>{ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); });
   }catch(e){ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); }
