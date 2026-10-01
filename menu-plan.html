@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20261001_remote_snapshot_consume_v1'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261001_shared_recovery_v2'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -1132,13 +1132,26 @@ function bootRender(){
   if(officialUrlWarning())setSyncBadge('warn','공식 주소 아님','address');
   if(FB_ON&&fbReady)setSyncBadge('ok','공유 연결됨','connection');
 }
+// Pending inputs survive updates only after exact durable verification.
+let sharedUpdateCheckFlight=null;
 function maybeReloadForUpdate(){
-  if(!appUpdatePending)return;
-  if(sharedInputCore.hasPending())return;
-  if(menuEditing()||saveInFlight||saveQueued)return;
+ if(!sharedJournalReady||!appUpdatePending||sharedUpdateCheckFlight)return sharedUpdateCheckFlight||Promise.resolve(false);
+ const saveNumber=sharedUiSaveNumber;
+ const quiet=()=>appUpdatePending&&!menuEditing()&&!sharedUiMutationFrame&&!saveInFlight&&!saveQueued&&!saveTimer&&sharedUiSaveNumber===saveNumber;
+ // Embedded order/ledger UI owns its own editing state. Until it offers a verified
+ // durable-reload contract, conservatively defer automatic reload once instantiated.
+ const noOrderSession=()=>!document.getElementById('bareunOrderFrame')&&!(typeof ordHasPendingShared==='function'&&ordHasPendingShared());
+ if(!quiet()||!noOrderSession())return Promise.resolve(false);
+ sharedUpdateCheckFlight=Promise.resolve().then(async()=>{
+  if(!quiet()||!noOrderSession()||!await sharedInputCore.durableReloadReady())return false;
+  if(!quiet()||!noOrderSession())return false;
   setSyncBadge('warn','새 버전 적용 중','version');
-  flushSharedStateNow().finally(()=>setTimeout(()=>location.reload(),250));
+  // No timer gap after the final UI and durable-input fences.
+  location.reload();return true;
+ }).catch(()=>false).finally(()=>{sharedUpdateCheckFlight=null});
+ return sharedUpdateCheckFlight;
 }
+
 function checkAppVersion(){
   if(location.protocol==='file:'||!location.href||!window.fetch)return;
   const url=location.origin+location.pathname+'?version='+Date.now();
@@ -1523,7 +1536,28 @@ function createSharedJournalCore(options){
   try{return await inflight;}finally{inflight=null;}
  }
 
- return {prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),isQuarantined:r=>quarantined.some(q=>q.id===r.id&&q.hash===r.hash),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
+// Insert inside createSharedJournalCore. Expose durableReloadReady in returned API.
+async function durableReloadReady(){
+ const identity=()=>JSON.stringify(records.map(r=>[r.id,r.hash]));
+ const initial=identity();
+ const quiet=()=>!inflight&&!failed&&!staged.length&&identity()===initial;
+ if(!quiet())return false;
+ await tail;
+ if(!quiet())return false;
+ for(const r of records.slice()){
+  const stored=await journal.get(r.id);
+  if(!stored||stored.id!==r.id||stored.hash!==r.hash||stored.state!=='pending'||JSON.stringify(stored.payload)!==JSON.stringify(r.payload)||!quiet())return false;
+ }
+ const durable=await journal.pending();
+ if(!quiet())return false;
+ // Preserved inputs are intentionally outside replay, but their exact identities remain known.
+ const expected=records.concat(quarantined).map(r=>[r.id,r.hash]).sort((a,b)=>a[0].localeCompare(b[0]));
+ const actual=durable.map(r=>[r.id,r.hash]).sort((a,b)=>a[0].localeCompare(b[0]));
+ if(JSON.stringify(expected)!==JSON.stringify(actual))return false;
+ return quiet();
+}
+
+ return {durableReloadReady,prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),isQuarantined:r=>quarantined.some(q=>q.id===r.id&&q.hash===r.hash),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
 }
 
 let sharedJournalBaseline=stateClone(S),sharedJournalReady=false;
@@ -1677,13 +1711,31 @@ document.addEventListener('visibilitychange',()=>{
   else{applyPendingRemoteState();maybeReloadForUpdate();}
 });
 /* Firebase 시작 — 키가 있을 때만. 최신 데이터를 받아와 화면 갱신, 이후 실시간 동기화 */
+let sharedBootstrapFlight=null,sharedBootstrapRetry=null,sharedBootstrapAttempts=0,sharedBootstrapTerminal=false;
+function boundedSharedBootstrapNetwork(work){
+ let timer;return Promise.race([Promise.resolve(work),new Promise((_,reject)=>{
+  timer=setTimeout(()=>{const e=new Error('공유 연결 응답 시간 초과');e.code='SHARED_BOOTSTRAP_TIMEOUT';reject(e);},20000);
+ })]).finally(()=>clearTimeout(timer));
+}
+function scheduleSharedBootstrapRetry(immediate=false){
+ if(!FB_ON||fbReady||sharedBootstrapTerminal||sharedBootstrapFlight)return;
+ if(sharedBootstrapRetry!==null)clearTimeout(sharedBootstrapRetry);
+ const delay=immediate?0:Math.min(30000,1000*Math.pow(2,Math.min(sharedBootstrapAttempts-1,5)));
+ sharedBootstrapRetry=setTimeout(()=>{sharedBootstrapRetry=null;initFirebase();},delay);
+}
+window.addEventListener('online',()=>scheduleSharedBootstrapRetry(true));
+window.addEventListener('focus',()=>scheduleSharedBootstrapRetry(true));
 function initFirebase(){
-  if(!FB_ON) return;
-  setSyncBadge('busy','공유 연결 중');
-  try{
-    firebase.initializeApp(window.FIREBASE_CONFIG);
-    fbRef=firebase.database().ref('menuplan');   // 모두가 같은 한 곳을 공유
-    sharedPrepare().then(()=>centralWriteProbe(fbRef,'menu')).then(()=>fbRef.once('value')).then(snap=>{
+ if(!FB_ON||fbReady||sharedBootstrapTerminal)return Promise.resolve(false);
+ if(sharedBootstrapFlight)return sharedBootstrapFlight;
+ if(sharedBootstrapRetry!==null){clearTimeout(sharedBootstrapRetry);sharedBootstrapRetry=null;}
+ setSyncBadge('busy','공유 연결 중');
+ let phase='sdk';sharedBootstrapAttempts++;
+ sharedBootstrapFlight=Promise.resolve().then(async()=>{
+  if(!fbRef){if(!firebase.apps||!firebase.apps.length)firebase.initializeApp(window.FIREBASE_CONFIG);fbRef=firebase.database().ref('menuplan');}
+  phase='journal';await sharedPrepare();
+  phase='network';await boundedSharedBootstrapNetwork(centralWriteProbe(fbRef,'menu'));const snap=await boundedSharedBootstrapNetwork(fbRef.once('value'));
+  phase='apply';
       centralMarkReady('menu');
       const remote=decodeSharedStateFromFirebase(snap.val());
       const remoteRepaired = remote ? stateRepairMissingTs(remote,+remote.updatedAt||Date.now()) : false;
@@ -1697,7 +1749,7 @@ function initFirebase(){
       dirtyReset();sharedJournalBaseline=stateClone(S);fbApplying=false;
       fbReady=true;sharedResolveConnection(true);
       if(saveQueued||sharedInputCore.hasPending()){saveQueued=false;queueSharedStateWrite();}
-      bootRender();
+      menuBootFailed=false;bootRender();
       if(pendingRecoveryHold){try{console.warn('[bareun-recovery]',pendingRecoveryReason||'pending recovery hold')}catch(_){}}
       setTimeout(checkAppVersion,1500);
       setInterval(checkAppVersion,300000);
@@ -1712,9 +1764,18 @@ function initFirebase(){
         pendingRemoteState=r;
         applyPendingRemoteState();
       });
-    }).catch((e)=>{ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); });
-  }catch(e){ fbReady=false;menuBootFailed=true;sharedRejectConnection(e);centralMarkBlocked('menu',e);setSyncBadge('warn','관리자 확인 필요','connection');render(); }
+
+  sharedBootstrapAttempts=0;menuBootFailed=false;return true;
+ }).catch(e=>{
+  fbReady=false;menuBootFailed=true;
+  // A failed durable journal or invalid snapshot cannot be fixed by network retries.
+  sharedBootstrapTerminal=phase==='journal'||phase==='apply';
+  if(sharedBootstrapTerminal)sharedRejectConnection(e);
+  centralMarkBlocked('menu',e);setSyncBadge('warn',sharedBootstrapTerminal?'관리자 확인 필요':'공유 연결 재시도 중','connection');render();return false;
+ }).finally(()=>{sharedBootstrapFlight=null;if(!fbReady&&!sharedBootstrapTerminal)scheduleSharedBootstrapRetry();});
+ return sharedBootstrapFlight;
 }
+
 /* 조리장이 짠 식단을 검색·위험군·끌어오기 풀에 누적 (원본 3년치는 안 건드림) */
 function absorbPlan(){
   Object.keys(S.plan).forEach(date=>{['점심','저녁'].forEach(meal=>{
@@ -2085,7 +2146,7 @@ function badItemSet(date,meal){
 function updateStockBtn(){const sb=document.getElementById('stockBtn');if(sb){const n=(S.saved||[]).length;sb.textContent=n?('보관 '+n):'보관'}}
 function render(){
   if(FB_ON&&!fbReady){
-    showBootMessage(menuBootFailed?'식단을 불러오지 못했습니다. 잠시 후 다시 접속해 주세요.':'저장된 식단을 불러오는 중입니다…',menuBootFailed);
+    showBootMessage(menuBootFailed?(sharedBootstrapTerminal?'보관된 입력을 확인해야 합니다. 상단 공유 상태를 눌러 주세요.':'공유 연결을 다시 시도하고 있습니다…'):'저장된 식단을 불러오는 중입니다…',menuBootFailed);
     return;
   }
   if(!S.start)S.start=monday(iso(new Date()));
@@ -4797,5 +4858,6 @@ body.bareun-settings-mode .topin .food-tool{display:none!important}
   var publishedHistory=null;setInterval(function(){var next=window.bareunHistoricalMeals();if(next===publishedHistory)return;publishedHistory=next;try{var frame=document.querySelector('#bareunOrderFrame');if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'bareun-history-updated'},'*')}catch(e){}},500);window.addEventListener('message',function(event){var frame=document.getElementById('bareunOrderFrame'),data=event&&event.data;if(!frame||event.source!==frame.contentWindow||!data||data.type!=='bareun-order-history-updated')return;unionCache.revision='';publishedHistory=null;try{if(typeof drawSheet==='function'&&typeof cur!=='undefined'&&cur)drawSheet()}catch(_){}var next=window.bareunHistoricalMeals();publishedHistory=next;try{frame.contentWindow.postMessage({type:'bareun-history-updated',updatedAt:Number(data.updatedAt)||0},'*')}catch(e){}});
 })();
 </script>
+<script src="./menu-sync-diagnostics.js"></script>
 </body>
 </html>

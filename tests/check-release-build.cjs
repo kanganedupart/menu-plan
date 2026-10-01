@@ -2,8 +2,8 @@
 const fs=require('node:fs'),cp=require('node:child_process'),assert=require('node:assert/strict');
 const base=process.argv[2]||process.env.BASE_SHA;
 assert(/^[a-f0-9]{40}$/.test(base||'')&&!/^0+$/.test(base),'An existing comparison commit is required');
-const oldFile=name=>cp.execFileSync('git',['show',base+':'+name],{encoding:'utf8',maxBuffer:16000000});
-const files=['menu-plan.html','bareun-operation-journal.js','bareun-backup-archive.js','bareun-backup-runtime.js'];
+const oldFile=name=>!cp.execFileSync('git',['ls-tree','--name-only',base,'--',name],{encoding:'utf8'}).trim()?'':cp.execFileSync('git',['show',base+':'+name],{encoding:'utf8',maxBuffer:16000000});
+const files=['menu-plan.html','bareun-operation-journal.js','bareun-backup-archive.js','bareun-backup-runtime.js','menu-sync-diagnostics.js'];
 const before=oldFile('menu-plan.html'),after=fs.readFileSync('menu-plan.html','utf8');
 const pattern=/^const APP_BUILD='([^'\r\n]+)';/gm;
 function build(source){const matches=[...source.matchAll(pattern)];assert.equal(matches.length,1,'Exactly one app build identifier is required');return matches[0][1]}

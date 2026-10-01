@@ -23,3 +23,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       - name: Run isolated shared-save regression
         run: node tests/shared-sync-regression.cjs
+
+      - name: Check reconnect and durable update recovery
+        run: |
+          node tests/shared-bootstrap-retry.cjs
+          node tests/shared-durable-update.cjs
+          node tests/shared-diagnostics.cjs
