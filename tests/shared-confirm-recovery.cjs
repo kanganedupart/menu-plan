@@ -1,0 +1,23 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const html=fs.readFileSync(process.argv[2]||require('node:path').resolve(__dirname,'../menu-plan.html'),'utf8');
+const code=html.slice(html.indexOf('// Confirmation display follows acknowledgement'),html.indexOf('// 확정본 전체를 엑셀로'));
+const merge=html.slice(html.indexOf('function sharedMergeRemote('),html.indexOf('async function sharedPrepare('));
+const flush=html.slice(html.indexOf('function flushSharedStateNow('),html.indexOf('function queueSharedStateWrite('));
+let renders=0,proofs={},nextReject;
+const c={Promise,console,Date,sharedInputCore:{remoteAck:id=>proofs[id],drain:()=>Promise.resolve()},render:()=>renders++,S:{},sharedJournalBaseline:{},stateClone:x=>JSON.parse(JSON.stringify(x)),sharedOverlayRemote:x=>x,applyRemoteState:()=>{},fmt:x=>x,toast:()=>{},saveWeekConfirmation:()=>new Promise((resolve,reject)=>nextReject=reject),showSaveProblem:()=>{},setSyncBadge:()=>{},FB_ON:true,fbReady:true,fbRef:{},fbApplying:false,sharedJournalReady:true};
+vm.createContext(c);vm.runInContext(code+'\n'+merge+'\n'+flush,c);
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+const failed=ws=>vm.runInContext('weekConfirmationUi['+JSON.stringify(ws)+']',c);
+(async()=>{
+ c.acknowledgeWeekConfirmation('2026-10-05',true);nextReject(Object.assign(Error('offline'),{operationId:'op-a',operationHash:'hash-a'}));await tick();assert.equal(failed('2026-10-05').operationId,'op-a');
+ const before=renders;c.sharedMergeRemote({},true);assert.equal(renders,before);assert.equal(failed('2026-10-05').state,'failed');
+ proofs['op-b']={id:'op-b',hash:'hash-a',state:'server-resolved'};assert.equal(c.reconcileWeekConfirmationUi(),false);
+ proofs['op-a']={id:'op-a',hash:'wrong',state:'server-resolved'};assert.equal(c.reconcileWeekConfirmationUi(),false);
+ proofs['op-a']={id:'op-a',hash:'hash-a',state:'pending'};assert.equal(c.reconcileWeekConfirmationUi(),false);
+ proofs['op-a']={id:'op-a',hash:'hash-a',state:'server-resolved'};c.sharedMergeRemote({},true);assert.equal(failed('2026-10-05'),undefined);assert.equal(renders,before+1);
+ c.sharedMergeRemote({},true);assert.equal(renders,before+1,'no redundant render');
+ c.acknowledgeWeekConfirmation('2026-10-12',true);nextReject(Object.assign(Error('offline'),{operationId:'op-c',operationHash:'hash-c'}));await tick();proofs['op-c']={id:'op-c',hash:'hash-c',state:'server-acked'};const n=renders;assert.equal(await c.flushSharedStateNow(),true);assert.equal(failed('2026-10-12'),undefined);assert.equal(renders,n+1);
+ c.acknowledgeWeekConfirmation('2026-10-19',true);proofs['op-d']={id:'op-d',hash:'hash-d',state:'server-acked'};assert.equal(c.reconcileWeekConfirmationUi(),false,'pending does not clear');nextReject(Error('unknown identity'));await tick();assert.equal(c.reconcileWeekConfirmationUi(),false,'failure without exact identity remains');
+ const isolated={Promise};vm.createContext(isolated);vm.runInContext(code,isolated);assert.equal(isolated.reconcileWeekConfirmationUi(),false,'missing core guarded');
+ console.log('PASS: failure identity capture, ordinary remote unchanged, wrong ID/hash/state unchanged, exact resolved clears on merge, exact ACK clears on flush, pending and unidentified retained, missing core guarded');
+})().catch(e=>{console.error(e);process.exitCode=1});

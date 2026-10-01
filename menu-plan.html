@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20261001_shared_recovery_v2'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261002_confirm_receipt_settlement_v1'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -989,6 +989,7 @@ function applyPendingRemoteState(){
   sharedMergeRemote(r,_keepStart);
   try{void 0 /* old main-state raw preserved */}catch(e){}
   fbApplying=false;
+  if(typeof sharedInputCore!=='undefined'&&sharedInputCore.hasResolvedCleanup())queueSharedStateWrite();
   if(typeof render==='function'){buildPeriod(S.start);render()}
 }
 normalizeState();
@@ -1307,6 +1308,7 @@ function createSharedJournalCore(options){
  }
  let ready=null,failed=null,inflight=null,tail=Promise.resolve(),records=[],staged=[];
  const remoteAcks=new Map();
+ const resolvedCleanup=new Map();
  let blocked=[];
  let quarantined=[];
  const planOnly=r=>r.payload.changes.length>0&&r.payload.changes.every(c=>Array.isArray(c.path)&&c.path.length===3&&c.path[0]==='plan'&&c.path.every(k=>typeof k==='string'&&k.length>0));
@@ -1375,9 +1377,24 @@ function createSharedJournalCore(options){
    // Receipt proves this input was superseded by the verified final intent;
    // it does not claim every intermediate value was individually published.
    remoteAcks.set(r.id,{id:r.id,hash:r.hash,payload:r.payload,state:'server-resolved',resolutionId:link.resolutionId,resolutionHash:link.resolutionHash});
+   resolvedCleanup.set(r.id,{record:clone(r),receipt:{_sharedResolvedInputs:{[r.id]:clone(link)},_sharedResolutions:{[link.resolutionId]:clone(remote._sharedResolutions[link.resolutionId])}}});
    return r.id;
   }));
   records=records.filter(r=>!resolved.has(r.id));blocked=blocked.filter(r=>!resolved.has(r.id));
+ }
+ async function settleResolved(){
+  for(const [id,entry] of Array.from(resolvedCleanup)){
+   const record=entry.record;
+   if(!resolutionProof(entry.receipt,record))throw error('SHARED_ACK_MISMATCH');
+   const stored=await journal.get(id);
+   if(!stored||stored.id!==id||stored.hash!==record.hash||JSON.stringify(stored.payload)!==JSON.stringify(record.payload))throw error('SHARED_JOURNAL_MISMATCH');
+   if(stored.state!=='pending'&&stored.state!=='acked')throw error('SHARED_JOURNAL_MISMATCH');
+   // Supersession is not publication of each intermediate action. Preserve the
+   // exact original before normal acknowledged-record retention may prune it.
+   if(options.archivePreserved&&await options.archivePreserved(record)!==record.hash)throw error('SHARED_ARCHIVE_MISMATCH');
+   if(stored.state==='pending')await journal.ack(id,record.hash);
+   if(resolvedCleanup.get(id)===entry)resolvedCleanup.delete(id);
+  }
  }
  async function resolutionPreview(remote){
   await prepare();await tail;if(failed||staged.length)throw failed||error('입력 보관이 끝난 뒤 다시 확인해 주세요.');
@@ -1506,8 +1523,8 @@ function createSharedJournalCore(options){
 
  async function drain(){
   if(inflight)return inflight;
-  inflight=(async()=>{await prepare();await tail;if(failed)throw failed;
-   await drainResolutions();await drainContinuousChains();blocked=[];const deferred=[],seen=new Set();let firstConflict=null;
+  inflight=(async()=>{await prepare();await tail;if(failed)throw failed;await settleResolved();
+   await drainResolutions();await drainContinuousChains();await settleResolved();blocked=[];const deferred=[],seen=new Set();let firstConflict=null;
    while(true){await tail;if(failed)throw failed;const batch=records.filter(r=>!seen.has(r.id));if(!batch.length)break;
    for(const record of batch){seen.add(record.id);let conflict=null,resolved=false;
     const durable=await journal.get(record.id);
@@ -1515,7 +1532,7 @@ function createSharedJournalCore(options){
     if(durable.state==='acked'){records=records.filter(r=>r.id!==record.id);continue;}
     if(durable.state!=='pending')throw error('SHARED_JOURNAL_MISMATCH');
     const proved=remoteAcks.get(record.id);
-    if(proved&&proved.id===record.id&&proved.hash===record.hash){await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
+    if(proved&&proved.id===record.id&&proved.hash===record.hash){if(proved.state==='server-resolved')await settleResolved();else await journal.ack(record.id,record.hash);records=records.filter(r=>r.id!==record.id);continue;}
     const parents=deferred.filter(prior=>recordsDepend(record,prior));
     if(parents.length){deferred.push(record);blocked.push({id:record.id,hash:record.hash,reason:'dependent',blockedBy:parents.map(p=>p.id),paths:clone(record.payload.changes.map(c=>c.path))});continue;}
     const result=await options.transaction(current=>{conflict=null;resolved=false;try{if(resolutionProof(current,record)){resolved=true;return current;}return apply(current,record.payload,false);}catch(e){conflict=e;return undefined;}});
@@ -1530,7 +1547,9 @@ function createSharedJournalCore(options){
     if(options.onAck)options.onAck(record,result);
    }
    }
-   if(firstConflict){firstConflict.blocked=clone(blocked);throw firstConflict;}
+   await settleResolved();
+   blocked=blocked.filter(b=>records.some(r=>r.id===b.id&&r.hash===b.hash));
+   if(firstConflict&&blocked.length){firstConflict.blocked=clone(blocked);throw firstConflict;}
    return true;
   })();
   try{return await inflight;}finally{inflight=null;}
@@ -1540,7 +1559,7 @@ function createSharedJournalCore(options){
 async function durableReloadReady(){
  const identity=()=>JSON.stringify(records.map(r=>[r.id,r.hash]));
  const initial=identity();
- const quiet=()=>!inflight&&!failed&&!staged.length&&identity()===initial;
+ const quiet=()=>!inflight&&!failed&&!staged.length&&!resolvedCleanup.size&&identity()===initial;
  if(!quiet())return false;
  await tail;
  if(!quiet())return false;
@@ -1557,7 +1576,7 @@ async function durableReloadReady(){
  return quiet();
 }
 
- return {durableReloadReady,prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),isQuarantined:r=>quarantined.some(q=>q.id===r.id&&q.hash===r.hash),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length),failure:()=>failed};
+ return {hasResolvedCleanup:()=>resolvedCleanup.size>0,durableReloadReady,prepare,enqueue,drain,overlay,build,apply,resolutionPreview,queueResolution,pendingRecords:()=>clone(records),isQuarantined:r=>quarantined.some(q=>q.id===r.id&&q.hash===r.hash),pendingDetails,blocked:()=>clone(blocked),remoteAck:id=>remoteAcks.get(id)||null,hasPending:()=>!!(records.length||staged.length||resolvedCleanup.size),failure:()=>failed};
 }
 
 let sharedJournalBaseline=stateClone(S),sharedJournalReady=false;
@@ -1601,6 +1620,7 @@ function sharedMergeRemote(remote,keepStart){
  const overlaid=sharedOverlayRemote(remote);applyRemoteState(overlaid,keepStart);
  S.mealNotes=stateClone(overlaid.mealNotes||{});S.excludedMeals=stateClone(overlaid.excludedMeals||{});
  sharedJournalBaseline=stateClone(S);
+ if(typeof reconcileWeekConfirmationUi==='function'&&reconcileWeekConfirmationUi()&&typeof render==='function')render();
 }
 async function sharedPrepare(){
  await sharedInputCore.prepare();
@@ -1634,7 +1654,7 @@ window.bareunRetrySharedInput=async(id,hash)=>{
 function finishSharedAck(result){setSyncBadge('ok','공유 저장됨','menu');return result;}
 function flushSharedStateNow(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady))return Promise.resolve(false);
- return sharedInputCore.drain().then(()=>{setSyncBadge('ok','공유 저장됨');return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
+ return sharedInputCore.drain().then(()=>{if(typeof reconcileWeekConfirmationUi==='function'&&reconcileWeekConfirmationUi()&&typeof render==='function')render();setSyncBadge('ok','공유 저장됨');return true}).catch(e=>{showSaveProblem(e);setSyncBadge('warn','입력 보관됨 · 공유 확인 필요');return false});
 }
 function queueSharedStateWrite(){
  if(!(FB_ON&&fbReady&&fbRef&&!fbApplying&&sharedJournalReady)){saveQueued=true;return;}
@@ -2163,7 +2183,7 @@ function render(){
     const isPrev=(wk===0);                      // 위 주 = 직전(참고)
     const isConf=!!S.confirmed[ws];
     H+='<div class="wk'+(isPrev?' prevwk':'')+'"><div class="wkh"><span class="rng">'+fmt(ws)+' ~ '+fmt(we)+(isPrev?' · 직전 주(참고)':'')+'</span>'
-      +'<button class="cfbtn'+(isConf?' done':'')+'" onclick="confirmWeek(\''+ws+'\')">확정</button></div>';
+      +weekConfirmationButton(ws,isConf)+'</div>';
     const sun=addDays(ws,6);
     H+='<div class="grid"><div class="hd"></div>'+
       wkDates.map((d,i)=>dateHeaderHtml(d,DOW[i])).join('')+
@@ -3029,15 +3049,49 @@ function restoreData(ev){
   rd.readAsText(f);
   ev.target.value='';
 }
+// Confirmation display follows acknowledgement, while preserving the synchronous caller contract.
+const weekConfirmationUi=Object.create(null);
+function resetWeekConfirmationUi(ws){if(ws&&weekConfirmationUi[ws]&&weekConfirmationUi[ws].state!=='pending')delete weekConfirmationUi[ws];}
+function reconcileWeekConfirmationUi(){
+  if(typeof sharedInputCore==='undefined'||!sharedInputCore||typeof sharedInputCore.remoteAck!=='function')return false;
+  let changed=false;
+  for(const ws of Object.keys(weekConfirmationUi)){
+    const ui=weekConfirmationUi[ws];
+    if(ui.state!=='failed'||!ui.operationId||!ui.operationHash)continue;
+    const proof=sharedInputCore.remoteAck(ui.operationId);
+    if(proof&&proof.id===ui.operationId&&proof.hash===ui.operationHash&&['server-acked','server-resolved'].includes(proof.state)){
+      delete weekConfirmationUi[ws];changed=true;
+    }
+  }
+  return changed;
+}
+function weekConfirmationButton(ws,isConf){
+  const ui=weekConfirmationUi[ws],pending=ui&&ui.state==='pending',failed=ui&&ui.state==='failed';
+  const label=pending?'공유 확인 중…':failed?'공유 확인 필요':isConf?'확정됨':'확정';
+  const action=failed?"document.getElementById('syncBadge').click()":"confirmWeek('"+ws+"')";
+  return '<button class="cfbtn'+(isConf&&!pending&&!failed?' done':'')+'" '+(pending?'disabled aria-busy="true" ':'')+'onclick="'+action+'">'+label+'</button>';
+}
+function acknowledgeWeekConfirmation(ws,confirmed){
+  const ui={state:'pending',confirmed};weekConfirmationUi[ws]=ui;
+  render();
+  function failed(error){if(weekConfirmationUi[ws]!==ui)return;ui.state='failed';if(error&&error.operationId&&error.operationHash){ui.operationId=error.operationId;ui.operationHash=error.operationHash;}if(reconcileWeekConfirmationUi()){render();return;}render();toast(fmt(ws)+'~ 주 공유 확인이 필요해요 · 입력은 유지됩니다. 상단 공유 상태를 눌러 확인해 주세요',false);}
+  let completion;try{completion=saveWeekConfirmation(ws);}catch(error){showSaveProblem(error);failed(error);return;}
+  Promise.resolve(completion).then(result=>{
+    if(weekConfirmationUi[ws]!==ui)return;
+    if(!result||!result.ok){failed();return;}
+    delete weekConfirmationUi[ws];render();
+    toast(fmt(ws)+(confirmed?'~ 주 식단을 확정했어요':'~ 주 식단 확정을 해제했어요'),false);
+  },failed);
+}
 // 한 주(시작 월요일 ws)의 식단을 확정/해제
 function confirmWeek(ws){
+  if(weekConfirmationUi[ws]){if(weekConfirmationUi[ws].state==='failed')document.getElementById('syncBadge').click();return false;}
   if(S.confirmed[ws]){
     delete S.confirmed[ws];
     stateEnsureShape(S);
     S._ts.confirmed[ws]=nowStamp();
     dirtyMark('confirmed',ws);
-    saveWeekConfirmation(ws);render();
-    toast(fmt(ws)+'~ 주 식단 확정을 해제했어요',false);
+    acknowledgeWeekConfirmation(ws,false);
     return false;
   }
   const wd=[];for(let i=0;i<6;i++)wd.push(addDays(ws,i));
@@ -3057,8 +3111,7 @@ function confirmWeek(ws){
   S._ts.confirmed[ws]=nowStamp();
   dirtyMark('confirmed',ws);
   // 확정하면 누적 풀에도 반영
-  absorbPlan();saveWeekConfirmation(ws);render();
-  toast(fmt(ws)+'~ 주 식단을 확정했어요',false);
+  absorbPlan();acknowledgeWeekConfirmation(ws,true);
   return true;
 }
 // 현재 보는 2주 각각 확정
