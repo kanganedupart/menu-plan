@@ -1255,7 +1255,24 @@ function createSharedJournalCore(options){
   });
   if(todo.some(c=>c.path[0]==='savedItems')){out.saved=options.savedFromMap(saved,out.saved||[]);out._ts.saved=rev;}
   out._serverRev=rev;out.updatedAt=Math.max(Number(out.updatedAt)||0,rev);
-  if(!overlay)verifyConfirmations(out,intent);
+  if(!overlay){
+   verifyConfirmations(out,intent);
+   // A plan-only write from a window that missed confirmation must not alter
+   // a retained confirmed menu. Normal edits explicitly remove that confirmation.
+   const editedMeals=intentChanges(intent).filter(c=>c.path[0]==='plan'&&c.path.length===3);
+   for(const c of editedMeals){
+    const date=c.path[1],meal=c.path[2];
+    const names=cell=>((cell&&cell.items)||[]).map(x=>typeof x==='string'?x:x.n).filter(Boolean).sort();
+    if(same(names(c.before.value),names(c.after.value)))continue;
+    for(const [week,rec] of Object.entries(out.confirmed||{})){
+     if(!rec||!rec.data||!Object.prototype.hasOwnProperty.call(rec.data,date))continue;
+     const expected=rec.data[date][meal]||[];
+     if(!Array.isArray(expected)||!same(names(((out.plan||{})[date]||{})[meal]),expected.slice().sort())){
+      const e=error('SHARED_CONFLICT');e.details=[{path:c.path,week,reason:'retained-confirmed-menu-changed'}];throw e;
+     }
+    }
+   }
+  }
   return out;
  }
  let ready=null,failed=null,inflight=null,tail=Promise.resolve(),records=[],staged=[];
