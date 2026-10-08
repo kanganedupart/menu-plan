@@ -444,7 +444,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20261002_confirm_receipt_settlement_v1'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261008_stock_shared_boundary_v1'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -527,6 +527,7 @@ function fbEncodeMap(map){const out={};Object.keys(map||{}).forEach(k=>out[fbEnc
 function fbDecodeMap(map){const out={};Object.keys(map||{}).forEach(k=>out[fbDecodeKey(k)]=stateClone(map[k]));return out}
 function encodeSharedStateForFirebase(st){
   const out=stateClone(st||{});stateEnsureShape(out);
+  stripTransientState(out);
   out.fix=fbEncodeMap(out.fix);
   out._ts.fix=fbEncodeMap(out._ts.fix);
   return out;
@@ -1185,7 +1186,7 @@ function createSharedJournalCore(options){
   before=clone(before);after=clone(after);const changes=[];
   function add(path,stampKind,stampKey){const b=value(before,path),a=value(after,path);if(!same(b,a))changes.push({path,before:b,after:a,stampKind,stampKey});}
   function union(a,b){return Array.from(new Set(Object.keys(a||{}).concat(Object.keys(b||{}))));}
-  union(before.plan,after.plan).forEach(d=>union((before.plan||{})[d],(after.plan||{})[d]).forEach(m=>add(['plan',d,m],'plan',d+'|'+m)));
+  union(before.plan,after.plan).filter(d=>d!=='__stock__').forEach(d=>union((before.plan||{})[d],(after.plan||{})[d]).forEach(m=>add(['plan',d,m],'plan',d+'|'+m)));
   ['confirmed','fix','cleared','lunchboxDates','mealEvents','excludedMeals'].forEach(kind=>union(before[kind],after[kind]).forEach(k=>add([kind,k],kind,k)));
   union(before.mealNotes,after.mealNotes).forEach(bucket=>{
    const b=(before.mealNotes||{})[bucket],a=(after.mealNotes||{})[bucket];
@@ -1204,6 +1205,9 @@ function createSharedJournalCore(options){
  function intentChanges(intent){
   const out=[];const object=v=>v&&typeof v==='object'&&!Array.isArray(v);
   for(const c of intent.changes){
+   // The stock editor is local-only and the Firebase codec never stores it.
+   // Project older journals without rewriting their preserved original bytes.
+   if(c.path[0]==='plan'&&c.path[1]==='__stock__')continue;
    if(c.path.length!==2||c.path[0]!=='fix'||!c.before.exists||!c.after.exists||!object(c.before.value)||!object(c.after.value)||canonical(c.after.value)===undefined){out.push(c);continue;}
    const b=c.before.value,a=c.after.value,keys=Array.from(new Set(Object.keys(b).concat(Object.keys(a))));
    const slotChanged=['slot','slotUser'].some(k=>!same(value(b,[k]),value(a,[k])));

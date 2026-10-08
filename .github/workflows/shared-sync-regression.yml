@@ -35,3 +35,4 @@ jobs:
           node tests/shared-resolved-settlement.cjs
           node tests/shared-confirm-ack.cjs
           node tests/shared-confirm-recovery.cjs
+          node tests/shared-stock-boundary.cjs
