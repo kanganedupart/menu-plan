@@ -445,7 +445,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20261008_shared_reconnect_v1'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261029_candidate_pages_v1'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -2610,7 +2610,11 @@ let replaceIdx=-1;
 let quickOpen=false;   // 작년 비슷한 날 더 보기 펼침 상태
 let expandIdx=-1;   // 현재 펼친(버튼 보이는) 항목 index
 function toggleExpand(i){expandIdx=(expandIdx===i?-1:i);if(expandIdx!==i){replaceIdx=-1;algEditIdx=-1}drawSheet()}
-function toggleReplace(i){replaceIdx=(replaceIdx===i?-1:i);algEditIdx=-1;window._rq='';drawSheet()}
+let replaceView={page:0,query:'',seed:''}; // 표시 전용: 저장·공유 상태에 넣지 않음
+function toggleReplace(i){replaceIdx=(replaceIdx===i?-1:i);algEditIdx=-1;window._rq='';replaceView={page:0,query:'',seed:iso(new Date())};drawSheet()}
+function replaceDailyOrder(name,seed){let h=2166136261;for(const ch of seed+'|'+name){h^=ch.charCodeAt(0);h=Math.imul(h,16777619)}return h>>>0}
+function replaceAgeGroup(last,date){if(!last)return 0;const days=(parse(date)-parse(last))/864e5;return days>=90?1:days>=28?2:days>=14?3:4}
+function pageReplace(i,step){replaceView.page+=step;drawReplace(i)}
 /* 이 후보(cand)를 i번 자리에 넣으면, "그 후보 자신 때문에" 생기는 경고 수.
    끼니에 이미 있던(다른 메뉴가 일으킨) 경고는 빼고 센다. */
 function warnCountIfReplace(i,cand){
@@ -2634,6 +2638,8 @@ function warnCountIfReplace(i,cand){
 }
 function drawReplace(i){
   const q=((document.getElementById('repIn')||{}).value||'').trim();window._rq=q;
+  if(replaceView.query!==q){replaceView.query=q;replaceView.page=0}
+  if(!replaceView.seed)replaceView.seed=iso(new Date());
   const el=document.getElementById('repRes');if(!el)return;
   const it=S.plan[cur.date][cur.meal].items[i];if(!it)return;
   const date=cur.date;const sl=slotOf(it.n);
@@ -2643,22 +2649,28 @@ function drawReplace(i){
   const wc={};list.forEach(m=>{wc[m.name]=warnCountIfReplace(i,m.name)});
   list.sort((a,b)=>{
     if(wc[a.name]!==wc[b.name])return wc[a.name]-wc[b.name];   // 경고 적은 것 먼저
-    const al=lastBefore(a.name,date)||'0',bl=lastBefore(b.name,date)||'0';
-    if(al!==bl)return al<bl?-1:1;                              // 오래 안 쓴 것
-    return (b.cnt||0)-(a.cnt||0);                              // 자주 쓴 것
+    const ag=replaceAgeGroup(lastBefore(a.name,date),date),bg=replaceAgeGroup(lastBefore(b.name,date),date);
+    if(ag!==bg)return ag-bg;                                  // 오래 미사용한 그룹 우선
+    const daily=replaceDailyOrder(a.name,replaceView.seed)-replaceDailyOrder(b.name,replaceView.seed);
+    return daily||(b.cnt||0)-(a.cnt||0)||a.name.localeCompare(b.name,'ko');
   });
-  list=list.slice(0,20);
+  const total=list.length,pages=Math.max(1,Math.ceil(total/10));
+  replaceView.page=((replaceView.page%pages)+pages)%pages;
+  list=list.slice(replaceView.page*10,(replaceView.page+1)*10);
   let head='';
   if(q && !Object.values(MENU).some(m=>m.name===q)){
     head='<div class="li2 newm" onclick="doReplace('+i+',\''+jss(q)+'\',true)">'
       +'<span class="nm">+ ‘'+esc(q)+'’ 새 메뉴로 넣기</span></div>';
   }
   if(!list.length&&!head){el.innerHTML='<div class="empty-note">없어요. 이름을 바꿔 찾아보세요.</div>';return}
-  el.innerHTML=head+list.map(m=>{
+  el.innerHTML=(replaceView.page===0?head:'')+list.map(m=>{
     const warns=wc[m.name];
     return '<div class="li2'+(warns>0?' warn':'')+'" onclick="doReplace('+i+',\''+jss(m.name)+'\')">'
       +'<span class="nm">'+esc(m.name)+(warns>0?'<span class="wflag">주의</span>':'')+'</span></div>';
-  }).join('');
+  }).join('')+'<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:14px;padding:6px 0">'
+    +'<button type="button" class="mini" aria-label="이전 교체 후보" '+(pages===1?'disabled':'')+' onclick="pageReplace('+i+',-1)">←</button>'
+    +'<span role="status" aria-live="polite" style="font-size:12px;color:var(--muted)">'+(replaceView.page+1)+' / '+pages+' · '+total+'개</span>'
+    +'<button type="button" class="mini" aria-label="다음 교체 후보" '+(pages===1?'disabled':'')+' onclick="pageReplace('+i+',1)">→</button></div>';
 }
 function guessNew(name,fallbackSlot){
   // 자리 추측

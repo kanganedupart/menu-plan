@@ -38,3 +38,4 @@ jobs:
           node tests/shared-stock-boundary.cjs
           node tests/shared-reconnect.cjs
           node tests/shared-status-visibility.cjs
+          node tests/replace-candidate-pages.cjs

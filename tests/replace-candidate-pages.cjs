@@ -1,0 +1,25 @@
+'use strict';
+const fs=require('fs'),vm=require('vm'),assert=require('assert/strict'),path=require('path');
+const html=fs.readFileSync(path.join(__dirname,'../menu-plan.html'),'utf8');
+const controls=html.slice(html.indexOf('let replaceView='),html.indexOf('/* 이 후보(cand)'));
+const draw=html.slice(html.indexOf('function drawReplace('),html.indexOf('function guessNew('));
+const names=Array.from({length:37},(_,i)=>'메뉴'+String(i).padStart(2,'0'));
+const MENU=Object.fromEntries(['현재',...names,'국메뉴'].map(name=>[name,{name,slot:name==='국메뉴'?'국':'메인',cnt:1}]));
+const state={plan:{'2026-11-02':{저녁:{items:[{n:'현재'}]}}}},before=JSON.stringify(state);
+const input={value:''},result={innerHTML:''};
+const c={MENU,S:state,cur:{date:'2026-11-02',meal:'저녁'},window:{},document:{getElementById:id=>id==='repIn'?input:result},iso:()=> '2026-10-29',parse:d=>new Date(d),slotOf:n=>MENU[n].slot,lastBefore:()=>'',warnCountIfReplace:(_i,n)=>n==='메뉴36'?1:0,cho:n=>n,esc:n=>n,jss:n=>n,replaceIdx:-1,algEditIdx:-1,drawSheet(){c.drawReplace(0)}};
+vm.createContext(c);vm.runInContext(controls+draw,c);
+function shown(){return [...result.innerHTML.matchAll(/class="nm">([^<]+)/g)].map(x=>x[1])}
+c.toggleReplace(0);const first=shown();assert.equal(first.length,10);
+c.pageReplace(0,1);assert.notDeepEqual(shown(),first);c.pageReplace(0,-1);assert.deepEqual(shown(),first);
+const all=[];for(let i=0;i<4;i++){all.push(...shown());c.pageReplace(0,1)}
+assert.deepEqual([...all].sort(),names);assert.equal(new Set(all).size,37);assert.equal(all.at(-1),'메뉴36');assert.deepEqual(shown(),first);
+c.pageReplace(0,-1);assert.equal(shown().length,7);c.pageReplace(0,1);assert.deepEqual(shown(),first);
+c.toggleReplace(0);c.toggleReplace(0);assert.deepEqual(shown(),first);
+vm.runInContext("replaceView.seed='2026-10-30'",c);c.drawReplace(0);assert.notDeepEqual(shown(),first);
+input.value='メニュー不存在';c.drawReplace(0);assert.equal(shown().length,1);assert.match(result.innerHTML,/새 메뉴로 넣기/);
+input.value='메뉴01';c.drawReplace(0);assert.deepEqual(shown(),['메뉴01']);assert.match(result.innerHTML,/1 \/ 1 · 1개/);assert.match(result.innerHTML,/disabled/);
+input.value='';c.drawReplace(0);assert.match(result.innerHTML,/1 \/ 4 · 37개/);
+assert.equal(JSON.stringify(state),before,'browsing candidates never changes meal state');
+assert.equal(c.replaceAgeGroup('',c.cur.date),0);assert.ok(c.replaceAgeGroup('2026-07-01',c.cur.date)<c.replaceAgeGroup('2026-11-01',c.cur.date));
+console.log('PASS: full coverage, forward/back, wraparound, daily order, same-day stability, search reset, warning priority, meal state unchanged');
