@@ -445,7 +445,7 @@ const VIEW_LS=LS+'_view_start'; // 날짜 보기 위치는 공유하지 않고 �
 const BACKUP_LS=LS+'_backups';  // 저장/동기화 사고 복구용 로컬 백업
 const PENDING_LS=LS+'_pending_shared'; // Firebase 저장 확인 전인 로컬 변경 보호
 const PLAN_LOGIC_VER=15;   // 식단 채우기 로직 버전 — 올리면 기존 자동식단을 새로 채움 (6/15 실제식단 반영)
-const APP_BUILD='20261029_candidate_pages_v2'; // 배포 캐시/구버전 확인용
+const APP_BUILD='20261029_candidate_pages_v3'; // 배포 캐시/구버전 확인용
 const ALLOW_EMPTY_REMOTE_LOCAL_IMPORT=false; // 운영 중 Firebase가 비었을 때 오래된 로컬 데이터를 자동 업로드하지 않음
 const CLIENT_LS=LS+'_client_id';
 let CLIENT_ID=localStorage.getItem(CLIENT_LS);if(!CLIENT_ID){CLIENT_ID='c'+Math.random().toString(36).slice(2)+Date.now().toString(36);try{localStorage.setItem(CLIENT_LS,CLIENT_ID)}catch(e){}}
@@ -2649,7 +2649,8 @@ function drawReplace(i){
   let list=Object.values(MENU).filter(m=>m.slot===sl&&m.name!==it.n);
   if(q)list=list.filter(m=>m.name.includes(q)||cho(m.name).includes(q));
   // 후보별 "넣었을 때 경고 수" 미리 계산
-  const wc={},age={},dailyOrder={};list.forEach(m=>{wc[m.name]=warnCountIfReplace(i,m.name);age[m.name]=replaceAgeGroup(lastBefore(m.name,date),date);dailyOrder[m.name]=replaceDailyOrder(m.name,replaceView.seed)});
+  const orderSeed=JSON.stringify([replaceView.seed,date,cur.meal,i,it.n]);
+  const wc={},age={},dailyOrder={};list.forEach(m=>{wc[m.name]=warnCountIfReplace(i,m.name);age[m.name]=replaceAgeGroup(lastBefore(m.name,date),date);dailyOrder[m.name]=replaceDailyOrder(m.name,orderSeed)});
   list.sort((a,b)=>{
     if(wc[a.name]!==wc[b.name])return wc[a.name]-wc[b.name];   // 경고 적은 것 먼저
     const ag=age[a.name],bg=age[b.name];
@@ -2675,7 +2676,7 @@ function drawReplace(i){
       +'<span class="nm">'+esc(m.name)+(warns>0?'<span class="wflag">주의</span>':'')+'</span></div>';
   }).join('')+'<div style="grid-column:1/-1;display:flex;align-items:center;justify-content:center;gap:14px;padding:6px 0">'
     +'<button type="button" class="mini" aria-label="이전 교체 후보" '+(pages===1?'disabled':'')+' onclick="pageReplace('+i+',-1)">←</button>'
-    +'<span role="status" aria-live="polite" style="font-size:12px;color:var(--muted)">'+(replaceView.page+1)+' / '+pages+' · '+total+'개</span>'
+    +'<span role="status" aria-live="polite" style="font-size:12px;color:var(--muted)">'+(replaceView.page+1)+' / '+pages+'</span>'
     +'<button type="button" class="mini" aria-label="다음 교체 후보" '+(pages===1?'disabled':'')+' onclick="pageReplace('+i+',1)">→</button></div>';
 }
 function guessNew(name,fallbackSlot){
