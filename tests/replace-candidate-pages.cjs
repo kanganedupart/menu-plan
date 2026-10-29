@@ -21,5 +21,15 @@ input.value='メニュー不存在';c.drawReplace(0);assert.equal(shown().length
 input.value='메뉴01';c.drawReplace(0);assert.deepEqual(shown(),['메뉴01']);assert.match(result.innerHTML,/1 \/ 1 · 1개/);assert.match(result.innerHTML,/disabled/);
 input.value='';c.drawReplace(0);assert.match(result.innerHTML,/1 \/ 4 · 37개/);
 assert.equal(JSON.stringify(state),before,'browsing candidates never changes meal state');
+let warningCalls=0,lastCalls=0;
+c.warnCountIfReplace=()=>{warningCalls++;return 0};c.lastBefore=()=>{lastCalls++;return ''};
+c.toggleReplace(0);c.toggleReplace(0);
+assert.equal(lastCalls,74,'last-used date is calculated once per candidate per opening');
+const calls=warningCalls;c.pageReplace(0,1);c.pageReplace(0,-1);
+assert.equal(warningCalls,calls,'paging must reuse scores');assert.equal(lastCalls,74);
+state.plan['2026-11-02'].저녁.items.push({n:'메뉴01'});c.drawReplace(0);
+assert.ok(warningCalls>calls,'changed meal invalidates cached warnings');
+const afterChange=warningCalls;MENU['메뉴00'].slot='국';c.drawReplace(0);
+assert.ok(warningCalls>afterChange,'changed classification invalidates cache');
 assert.equal(c.replaceAgeGroup('',c.cur.date),0);assert.ok(c.replaceAgeGroup('2026-07-01',c.cur.date)<c.replaceAgeGroup('2026-11-01',c.cur.date));
 console.log('PASS: full coverage, forward/back, wraparound, daily order, same-day stability, search reset, warning priority, meal state unchanged');
